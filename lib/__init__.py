@@ -52,3 +52,7 @@ OmegaConf.register_new_resolver(
     "nbody",
     lambda x: get_nbody(x),
 )  # assuming right and left hands have the same number of bodies
+OmegaConf.register_new_resolver(
+    "bps_dim",
+    lambda use_bps: 128 if use_bps else 0,
+)  # BPS dimension: 128 when enabled, 0 when disabled

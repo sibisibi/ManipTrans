@@ -13,6 +13,7 @@ env:
   training: ${if:${...test},False,True}
 
   usePIDControl: ${...usePIDControl}
+  useBPS: ${resolve_default:True,${...useBPS}}
 
   rolloutStateInit: ${resolve_default:False,${...rolloutStateInit}}
   randomStateInit: ${resolve_default:True,${...randomStateInit}}

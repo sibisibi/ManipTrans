@@ -65,6 +65,7 @@ class DexHandManipBiHEnv(VecTask):
         self.dexhand_lh = DexHandFactory.create_hand(self.cfg["env"]["dexhand"], "left")
 
         self.use_pid_control = self.cfg["env"]["usePIDControl"]
+        self.use_bps = self.cfg["env"].get("useBPS", True)
         if self.use_pid_control:
             self.Kp_rot = self.dexhand_rh.Kp_rot
             self.Ki_rot = self.dexhand_rh.Ki_rot
@@ -141,7 +142,7 @@ class DexHandManipBiHEnv(VecTask):
             headless=headless,
         )
         TARGET_OBS_DIM = (
-            128
+            (128 if self.use_bps else 0)
             + 5
             + (
                 3
@@ -188,16 +189,17 @@ class DexHandManipBiHEnv(VecTask):
         # self.dexhand_rh_default_dof_pos = torch.tensor([-3.5322e-01,  -0.100e-01,  3.2278e-01, -2.51e+00,  1.6036e-01,
         #   2.564e+00, 0.5,  0.10,  0.10], device=self.sim_device)
 
-        # load BPS model
-        self.bps_feat_type = "dists"
-        self.bps_layer = bps_torch(
-            bps_type="grid_sphere", n_bps_points=128, radius=0.2, randomize=False, device=self.device
-        )
+        # load BPS model (optional)
+        if self.use_bps:
+            self.bps_feat_type = "dists"
+            self.bps_layer = bps_torch(
+                bps_type="grid_sphere", n_bps_points=128, radius=0.2, randomize=False, device=self.device
+            )
 
-        obj_verts_rh = self.demo_data_rh["obj_verts"]
-        self.obj_bps_rh = self.bps_layer.encode(obj_verts_rh, feature_type=self.bps_feat_type)[self.bps_feat_type]
-        obj_verts_lh = self.demo_data_lh["obj_verts"]
-        self.obj_bps_lh = self.bps_layer.encode(obj_verts_lh, feature_type=self.bps_feat_type)[self.bps_feat_type]
+            obj_verts_rh = self.demo_data_rh["obj_verts"]
+            self.obj_bps_rh = self.bps_layer.encode(obj_verts_rh, feature_type=self.bps_feat_type)[self.bps_feat_type]
+            obj_verts_lh = self.demo_data_lh["obj_verts"]
+            self.obj_bps_lh = self.bps_layer.encode(obj_verts_lh, feature_type=self.bps_feat_type)[self.bps_feat_type]
 
         # Reset all environments
         self.reset_idx(torch.arange(self.num_envs, device=self.device))
@@ -1240,33 +1242,32 @@ class DexHandManipBiHEnv(VecTask):
 
         next_target_state["gt_tips_distance"] = indicing(side_demo_data["tips_distance"], cur_idx).reshape(nE, -1)
 
-        next_target_state["bps"] = getattr(self, f"obj_bps_{side}")
+        obs_keys = [  # ! must be in the same order as the following
+            "delta_wrist_pos",
+            "wrist_vel",
+            "delta_wrist_vel",
+            "wrist_quat",
+            "delta_wrist_quat",
+            "wrist_ang_vel",
+            "delta_wrist_ang_vel",
+            "delta_joints_pos",
+            "joints_vel",
+            "delta_joints_vel",
+            "delta_manip_obj_pos",
+            "manip_obj_vel",
+            "delta_manip_obj_vel",
+            "manip_obj_quat",
+            "delta_manip_obj_quat",
+            "manip_obj_ang_vel",
+            "delta_manip_obj_ang_vel",
+            "obj_to_joints",
+            "gt_tips_distance",
+        ]
+        if self.use_bps:
+            next_target_state["bps"] = getattr(self, f"obj_bps_{side}")
+            obs_keys.append("bps")
         obs_dict["target"] = torch.cat(
-            [
-                next_target_state[ob]
-                for ob in [  # ! must be in the same order as the following
-                    "delta_wrist_pos",
-                    "wrist_vel",
-                    "delta_wrist_vel",
-                    "wrist_quat",
-                    "delta_wrist_quat",
-                    "wrist_ang_vel",
-                    "delta_wrist_ang_vel",
-                    "delta_joints_pos",
-                    "joints_vel",
-                    "delta_joints_vel",
-                    "delta_manip_obj_pos",
-                    "manip_obj_vel",
-                    "delta_manip_obj_vel",
-                    "manip_obj_quat",
-                    "delta_manip_obj_quat",
-                    "manip_obj_ang_vel",
-                    "delta_manip_obj_ang_vel",
-                    "obj_to_joints",
-                    "gt_tips_distance",
-                    "bps",
-                ]
-            ],
+            [next_target_state[ob] for ob in obs_keys],
             dim=-1,
         )
 

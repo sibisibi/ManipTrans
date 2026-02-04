@@ -27,6 +27,7 @@ learning_rate: 5e-4
 actionsMovingAverage: 1.0
 
 usePIDControl: False
+useBPS: True
 
 dataIndices: [7]
 
