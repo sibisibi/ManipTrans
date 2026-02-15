@@ -189,3 +189,6 @@ make*.py
 
 runs
 runs/*
+
+custom_install.md
+.claude/

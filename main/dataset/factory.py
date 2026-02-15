@@ -44,6 +44,8 @@ class ManipDataFactory:
             dtype = "oakink2"
         elif type(index) == str and index.startswith("g"):
             dtype = "grabdemo"
+        elif type(index) == str and index.startswith("hp"):
+            dtype = "handphuma"
         elif type(index) == str and index.startswith("v"):
             dtype = "visionpro"
         else:

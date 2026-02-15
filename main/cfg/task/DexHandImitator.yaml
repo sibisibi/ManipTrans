@@ -18,6 +18,8 @@ env:
   randomStateInit: ${resolve_default:True,${...randomStateInit}}
 
   dataIndices: ${resolve_default:[],${...dataIndices}}
+  dataDir: ${resolve_default:'',${...data_dir}}
+  indexPath: ${resolve_default:'',${...index_path}}
   obsFutureLength: 1
 
   clipObservations: 5.0

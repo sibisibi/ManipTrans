@@ -222,19 +222,37 @@ class DexHandImitatorRHEnv(VecTask):
         mujoco2gym_transf[:3, 3] = np.array([0, 0, self._table_surface_z])
         self.mujoco2gym_transf = torch.tensor(mujoco2gym_transf, device=self.sim_device, dtype=torch.float32)
 
-        dataset_list = list(set([ManipDataFactory.dataset_type(data_idx) for data_idx in self.dataIndices]))
+        create_kwargs = dict(
+            side=self.side,
+            device=self.sim_device,
+            mujoco2gym_transf=self.mujoco2gym_transf,
+            max_seq_len=self.max_episode_length,
+            dexhand=self.dexhand,
+            embodiment=self.cfg["env"]["dexhand"],
+        )
 
-        self.demo_dataset_dict = {}
-        for dataset_type in dataset_list:
-            self.demo_dataset_dict[dataset_type] = ManipDataFactory.create_data(
-                manipdata_type=dataset_type,
-                side=self.side,
-                device=self.sim_device,
-                mujoco2gym_transf=self.mujoco2gym_transf,
-                max_seq_len=self.max_episode_length,
-                dexhand=self.dexhand,
-                embodiment=self.cfg["env"]["dexhand"],
+        index_path = self.cfg["env"].get("indexPath", "")
+        if index_path:
+            # index_path mode: create dataset directly, use all sequences
+            data_dir = self.cfg["env"].get("dataDir", "")
+            assert data_dir, "dataDir must be set when using indexPath"
+            self.demo_dataset = ManipDataFactory.create_data(
+                manipdata_type="handphuma",
+                data_dir=data_dir,
+                index_path=index_path,
+                **create_kwargs,
             )
+        else:
+            # Legacy dataIndices mode
+            data_dir = self.cfg["env"].get("dataDir", "")
+            if data_dir:
+                create_kwargs["data_dir"] = data_dir
+            dataset_list = list(set([ManipDataFactory.dataset_type(data_idx) for data_idx in self.dataIndices]))
+            self.demo_dataset_dict = {}
+            for dataset_type in dataset_list:
+                self.demo_dataset_dict[dataset_type] = ManipDataFactory.create_data(
+                    manipdata_type=dataset_type, **create_kwargs
+                )
 
         # load dexhand asset
         dexhand_asset_file = self.dexhand.urdf_path
@@ -313,14 +331,23 @@ class DexHandImitatorRHEnv(VecTask):
         self.dexhands = []
         self.envs = []
 
-        assert len(self.dataIndices) == 1 or not self.rollout_state_init, "rollout_state_init only works with one data"
+        if hasattr(self, 'demo_dataset'):
+            # index_path mode: use all sequences from the dataset
+            num_sequences = len(self.demo_dataset)
+            assert num_sequences > 0, "Dataset is empty"
+            assert num_sequences == 1 or not self.rollout_state_init, "rollout_state_init only works with one data"
 
-        dataset_list = list(set([ManipDataFactory.dataset_type(data_idx) for data_idx in self.dataIndices]))
+            def segment_data(k):
+                return self.demo_dataset[k % num_sequences]
+        else:
+            # Legacy dataIndices mode
+            assert len(self.dataIndices) == 1 or not self.rollout_state_init, "rollout_state_init only works with one data"
+            dataset_list = list(set([ManipDataFactory.dataset_type(data_idx) for data_idx in self.dataIndices]))
 
-        def segment_data(k):
-            todo_list = self.dataIndices
-            idx = todo_list[k % len(todo_list)]
-            return self.demo_dataset_dict[ManipDataFactory.dataset_type(idx)][idx]
+            def segment_data(k):
+                todo_list = self.dataIndices
+                idx = todo_list[k % len(todo_list)]
+                return self.demo_dataset_dict[ManipDataFactory.dataset_type(idx)][idx]
 
         self.demo_data = [segment_data(i) for i in tqdm(range(self.num_envs))]
         self.demo_data = self.pack_data(self.demo_data)
