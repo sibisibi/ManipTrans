@@ -44,15 +44,13 @@ class HandPhumaDatasetDexHandRH(ManipData):
 
         self.target_fps = target_fps
 
-        # Read index csv
+        # Load CSV index
         index_file = os.path.join(data_dir, index_path)
         self.sequences = []
         with open(index_file, newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 self.sequences.append(row)
-
-        # Build paths to rhand.npy
         self.data_pathes = []
         for seq in self.sequences:
             npy_path = os.path.join(data_dir, seq["dataset"], seq["filename"], "rhand.npy")
@@ -114,14 +112,32 @@ class HandPhumaDatasetDexHandRH(ManipData):
         assert 0 <= idx < len(self.data_pathes), f"index {idx} out of range [0, {len(self.data_pathes)})"
 
         seq_info = self.sequences[idx]
-        source_fps = int(seq_info["fps"])
         npy_path = self.data_pathes[idx]
+
+        source_fps = int(seq_info["fps"])
 
         raw = np.load(npy_path, allow_pickle=True).item()
 
         wrist_pos = raw["wrist_pos"]    # (T_raw, 3)  numpy
         wrist_rot = raw["wrist_rot"]    # (T_raw, 3, 3) numpy
         mano_joints = raw["mano_joints"]  # dict of numpy
+
+        # Check for pre-computed velocities
+        has_precomputed_vel = "wrist_velocity" in raw
+
+        # Chunk slicing (backward compatible: no-op if start_frame/end_frame absent)
+        if "start_frame" in seq_info and "end_frame" in seq_info:
+            sf, ef = int(seq_info["start_frame"]), int(seq_info["end_frame"])
+            wrist_pos, wrist_rot = wrist_pos[sf:ef], wrist_rot[sf:ef]
+            mano_joints = {k: v[sf:ef] for k, v in mano_joints.items()}
+            if has_precomputed_vel:
+                wrist_velocity = raw["wrist_velocity"][sf:ef]
+                wrist_angular_velocity = raw["wrist_angular_velocity"][sf:ef]
+                mano_joints_velocity = {k: v[sf:ef] for k, v in raw["mano_joints_velocity"].items()}
+        elif has_precomputed_vel:
+            wrist_velocity = raw["wrist_velocity"]
+            wrist_angular_velocity = raw["wrist_angular_velocity"]
+            mano_joints_velocity = raw["mano_joints_velocity"]
 
         # Resample to target_fps
         wrist_pos, wrist_rot, mano_joints = self._resample(
@@ -160,6 +176,13 @@ class HandPhumaDatasetDexHandRH(ManipData):
             "mano_joints": mano_joints,
         }
 
+        if has_precomputed_vel:
+            data["_precomputed_wrist_velocity"] = torch.tensor(wrist_velocity, device=self.device)
+            data["_precomputed_wrist_angular_velocity"] = torch.tensor(wrist_angular_velocity, device=self.device)
+            data["_precomputed_mano_joints_velocity"] = {
+                k: torch.tensor(v, device=self.device) for k, v in mano_joints_velocity.items()
+            }
+
         self.process_data(data, idx, data["obj_verts"])
 
         # Retargeted data (falls back to zeros if no file exists)
@@ -191,17 +214,31 @@ class HandPhumaDatasetDexHandRH(ManipData):
         data["obj_velocity"] = torch.zeros_like(data["obj_trajectory"][:, :3, 3])
         data["obj_angular_velocity"] = torch.zeros_like(data["obj_trajectory"][:, :3, 3])
 
-        data["wrist_velocity"] = self.compute_velocity(
-            data["wrist_pos"][:, None], time_delta, guassian_filter=True
-        ).squeeze(1)
-        data["wrist_angular_velocity"] = self.compute_angular_velocity(
-            aa_to_rotmat(data["wrist_rot"][:, None]), time_delta, guassian_filter=True
-        ).squeeze(1)
-        data["mano_joints_velocity"] = {}
-        for k in data["mano_joints"].keys():
-            data["mano_joints_velocity"][k] = self.compute_velocity(
-                data["mano_joints"][k], time_delta, guassian_filter=True
-            )
+        if "_precomputed_wrist_velocity" in data:
+            # Use pre-computed velocities: just apply coordinate rotation
+            R = self.mujoco2gym_transf[:3, :3]  # (3, 3) tensor
+            data["wrist_velocity"] = (R @ data["_precomputed_wrist_velocity"].T).T
+            data["wrist_angular_velocity"] = (R @ data["_precomputed_wrist_angular_velocity"].T).T
+            data["mano_joints_velocity"] = {}
+            for k in data["mano_joints"].keys():
+                data["mano_joints_velocity"][k] = (R @ data["_precomputed_mano_joints_velocity"][k].T).T
+            # Clean up temporary keys
+            del data["_precomputed_wrist_velocity"]
+            del data["_precomputed_wrist_angular_velocity"]
+            del data["_precomputed_mano_joints_velocity"]
+        else:
+            # Fallback: compute per-chunk (old behavior, for .npy files without velocities)
+            data["wrist_velocity"] = self.compute_velocity(
+                data["wrist_pos"][:, None], time_delta, guassian_filter=True
+            ).squeeze(1)
+            data["wrist_angular_velocity"] = self.compute_angular_velocity(
+                aa_to_rotmat(data["wrist_rot"][:, None]), time_delta, guassian_filter=True
+            ).squeeze(1)
+            data["mano_joints_velocity"] = {}
+            for k in data["mano_joints"].keys():
+                data["mano_joints_velocity"][k] = self.compute_velocity(
+                    data["mano_joints"][k], time_delta, guassian_filter=True
+                )
 
         # Truncate
         if len(data["obj_trajectory"]) > self.max_seq_len:
@@ -227,13 +264,11 @@ class HandPhumaDatasetDexHandRH(ManipData):
         time_delta = 1.0 / self.target_fps
 
         if not os.path.exists(retargeted_data_path):
-            if self.verbose:
-                cprint(f"\nWARNING: {retargeted_data_path} does not exist.", "red")
+            if self.verbose and not getattr(self, '_retarget_warned', False):
+                cprint(f"\nWARNING: Retargeted data not found (e.g. {retargeted_data_path}).", "red")
                 cprint(f"WARNING: This may lead to a slower transfer process or even failure to converge.", "red")
-                cprint(
-                    f"WARNING: It is recommended to first execute the retargeting code to obtain initial values.\n",
-                    "red",
-                )
+                cprint(f"WARNING: It is recommended to first execute the retargeting code to obtain initial values.\n", "red")
+                self._retarget_warned = True
             data.update(
                 {
                     "opt_wrist_pos": data["wrist_pos"],
@@ -255,15 +290,24 @@ class HandPhumaDatasetDexHandRH(ManipData):
                 }
             )
 
-        data["opt_wrist_velocity"] = self.compute_velocity(
-            data["opt_wrist_pos"][:, None], time_delta, guassian_filter=True
-        ).squeeze(1)
-        data["opt_wrist_angular_velocity"] = self.compute_angular_velocity(
-            aa_to_rotmat(data["opt_wrist_rot"][:, None]), time_delta, guassian_filter=True
-        ).squeeze(1)
-        data["opt_dof_velocity"] = self.compute_dof_velocity(
-            data["opt_dof_pos"], time_delta, guassian_filter=True
-        )
+        if not os.path.exists(retargeted_data_path):
+            # No retargeting (artimano): opt velocities = hand velocities
+            data["opt_wrist_velocity"] = data["wrist_velocity"].clone()
+            data["opt_wrist_angular_velocity"] = data["wrist_angular_velocity"].clone()
+            data["opt_dof_velocity"] = self.compute_dof_velocity(
+                data["opt_dof_pos"], time_delta, guassian_filter=True
+            )
+        else:
+            # Retargeted data from .pkl: compute velocities from retargeted positions
+            data["opt_wrist_velocity"] = self.compute_velocity(
+                data["opt_wrist_pos"][:, None], time_delta, guassian_filter=True
+            ).squeeze(1)
+            data["opt_wrist_angular_velocity"] = self.compute_angular_velocity(
+                aa_to_rotmat(data["opt_wrist_rot"][:, None]), time_delta, guassian_filter=True
+            ).squeeze(1)
+            data["opt_dof_velocity"] = self.compute_dof_velocity(
+                data["opt_dof_pos"], time_delta, guassian_filter=True
+            )
 
         if len(data["opt_wrist_pos"]) > self.max_seq_len:
             data["opt_wrist_pos"] = data["opt_wrist_pos"][: self.max_seq_len]

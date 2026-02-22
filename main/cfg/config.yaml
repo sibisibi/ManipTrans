@@ -33,6 +33,24 @@ dataIndices: [7]
 data_dir: ''
 index_path: ''
 
+# Curriculum
+tighten_steps: ''
+tighten_factor: ''
+
+# Two-level sampling
+traj_blend_alpha: ''
+bin_ema_alpha: ''
+sonic_blend_alpha: ''
+sonic_cap_beta: ''
+bin_conv_lambda: ''
+
+# Evaluation
+eval_every: ''
+chunk_metrics_log_every: ''
+
+# PPO
+minibatch_size: ''
+
 # seed - set to -1 to choose random seed
 seed: 42
 # set to True for deterministic performance

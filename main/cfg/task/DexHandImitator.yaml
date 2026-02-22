@@ -37,8 +37,15 @@ env:
   aggregateMode: 3
 
   tightenMethod: "exp_decay"
-  tightenFactor: 0.7 # 1.0 means no tightening restriction
-  tightenSteps: 128000
+  tightenFactor: ${resolve_default:0.7,${...tighten_factor}} # 1.0 means no tightening restriction
+  tightenSteps: ${resolve_default:128000,${...tighten_steps}}
+
+  # Two-level hierarchical sampling
+  trajBlendAlpha: ${resolve_default:0.1,${...traj_blend_alpha}}
+  binEmaAlpha: ${resolve_default:0.05,${...bin_ema_alpha}}
+  sonicBlendAlpha: ${resolve_default:0.1,${...sonic_blend_alpha}}
+  sonicCapBeta: ${resolve_default:200.0,${...sonic_cap_beta}}
+  binConvLambda: ${resolve_default:0.8,${...bin_conv_lambda}}
 
   actionScale: 1.0
   useQuatRot: false

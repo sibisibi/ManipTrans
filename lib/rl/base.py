@@ -334,6 +334,9 @@ class MyA2CBase(BaseAlgorithm):
         self.tau = self.config["tau"]
 
         self.games_to_track = self.config.get("games_to_track", 100)
+        self.chunk_metrics_log_every = self.config.get("chunk_metrics_log_every", 1)
+        self.eval_every = self.config.get("eval_every", 200)
+        self.curriculum_enabled = self.config.get("curriculum_enabled", True)
         print("current training device:", self.ppo_device)
         self.game_rewards = torch_ext.AverageMeter(self.value_size, self.games_to_track).to(self.ppo_device)
         self.game_success = torch_ext.AverageMeter(1, self.games_to_track).to(self.ppo_device)
@@ -775,6 +778,22 @@ class MyA2CBase(BaseAlgorithm):
             env_state = self.vec_env.get_env_state()
             state["env_state"] = env_state
 
+        # Save curriculum state
+        env = self.vec_env.env
+        if hasattr(env, 'sampling_weights') and env.sampling_weights is not None:
+            cur_state = {
+                'sampling_weights': env.sampling_weights.cpu(),
+                'chunk_eval_count': env.chunk_eval_count.cpu(),
+                'chunk_success_count': env.chunk_success_count.cpu(),
+                'chunk_fail_count': env.chunk_fail_count.cpu(),
+                'chunk_completion_sum': env.chunk_completion_sum.cpu(),
+                'chunk_reward_sum': env.chunk_reward_sum.cpu(),
+            }
+            # Two-level sampling state
+            if hasattr(env, 'bin_failed_count'):
+                cur_state['bin_failed_count'] = env.bin_failed_count.cpu()
+            state['curriculum'] = cur_state
+
         return state
 
     def set_full_state_weights(self, weights, set_epoch=True):
@@ -793,6 +812,28 @@ class MyA2CBase(BaseAlgorithm):
         if self.vec_env is not None:
             env_state = weights.get("env_state", None)
             self.vec_env.set_env_state(env_state)
+
+        # Restore curriculum state
+        if 'curriculum' in weights:
+            env = self.vec_env.env
+            if hasattr(env, 'sampling_weights') and env.sampling_weights is not None:
+                cur = weights['curriculum']
+                # Only restore if chunk count matches (dataset might have changed)
+                if cur['sampling_weights'].shape[0] == env.num_chunks:
+                    env.sampling_weights.copy_(cur['sampling_weights'].to(env.device))
+                    env.chunk_eval_count.copy_(cur['chunk_eval_count'].to(env.device))
+                    env.chunk_success_count.copy_(cur['chunk_success_count'].to(env.device))
+                    env.chunk_fail_count.copy_(cur['chunk_fail_count'].to(env.device))
+                    env.chunk_completion_sum.copy_(cur['chunk_completion_sum'].to(env.device))
+                    env.chunk_reward_sum.copy_(cur['chunk_reward_sum'].to(env.device))
+                    # Restore two-level sampling state
+                    if 'bin_failed_count' in cur and hasattr(env, 'bin_failed_count') \
+                            and cur['bin_failed_count'].shape[0] == env.num_chunks:
+                        env.bin_failed_count.copy_(cur['bin_failed_count'].to(env.device))
+                    print(f"[Curriculum] Restored state for {env.num_chunks} chunks")
+                else:
+                    print(f"[Curriculum] Chunk count mismatch: checkpoint has {cur['sampling_weights'].shape[0]}, "
+                          f"current has {env.num_chunks}. Starting fresh.")
 
     def get_weights(self):
         state = self.get_stats_weights()
@@ -875,6 +916,132 @@ class MyA2CBase(BaseAlgorithm):
                     raise NotImplementedError("Can't directly mutate kl threshold")
         else:
             raise NotImplementedError(f"No param found for {param_value}")
+
+    @torch.no_grad()
+    def _run_trajectory_eval(self, env, global_frame, epoch_num):
+        """Trajectory-level evaluation on the test set.
+
+        Runs full multi-chunk sequences end-to-end without physics resets
+        between chunks, measuring whether the policy can track entire
+        trajectories (30-60 seconds) rather than isolated 1-second chunks.
+        """
+        import json
+
+        # --- Setup ---
+        env.cache_training_state()
+        if not hasattr(env, '_test_trajectory_chunks'):
+            env._build_test_trajectory_map()
+
+        orig_rsi = env.random_state_init
+        env.random_state_init = False
+
+        # --- Assign trajectories to envs ---
+        num_trajs = len(env._test_trajectory_chunks)
+        traj_total_frames = env._test_trajectory_total_frames  # [num_trajs]
+
+        traj_alive = torch.ones(num_trajs, dtype=torch.bool, device=env.device)
+        traj_E_j_sum = torch.zeros(num_trajs, device=env.device)
+        traj_E_ft_sum = torch.zeros(num_trajs, device=env.device)
+        traj_E_wrist_sum = torch.zeros(num_trajs, device=env.device)
+        traj_steps = torch.zeros(num_trajs, dtype=torch.long, device=env.device)
+
+        # --- Initialize first chunks ---
+        for i in range(num_trajs):
+            first_chunk = env._test_trajectory_chunks[i][0]
+            env.motion_ids[i] = first_chunk
+
+        env_ids = torch.arange(num_trajs, device=env.device)
+        env.reset_buf[env_ids] = 1
+        saved_sw = env.sampling_weights
+        env.sampling_weights = None          # prevent _reset_default from overwriting motion_ids
+        env.reset_idx(env_ids)
+        env.sampling_weights = saved_sw      # restore for _handle_chunk_continuation in step loop
+
+        # --- Step loop ---
+        max_total_steps = int(traj_total_frames.max().item())
+        for step_i in range(max_total_steps):
+            if not traj_alive.any():
+                break
+
+            env.compute_observations()
+            obs_dict = env.obs_dict
+            processed_obs = self.obs_to_tensors(obs_dict)
+            res_dict = self.get_action_values(processed_obs)
+            actions = res_dict["mus"]  # deterministic
+
+            env.step(actions)
+            metrics = env.compute_eval_metrics()
+
+            # Accumulate metrics for alive trajectories
+            alive_f = traj_alive.float()
+            traj_E_j_sum += metrics["E_j"][:num_trajs] * alive_f
+            traj_E_ft_sum += metrics["E_ft"][:num_trajs] * alive_f
+            traj_E_wrist_sum += metrics["E_wrist_pos"][:num_trajs] * alive_f
+            traj_steps += traj_alive.long()
+
+            # Check failure (after 20-frame grace period)
+            if step_i >= 20:
+                newly_failed = metrics["failed"][:num_trajs] & traj_alive
+                traj_alive[newly_failed] = False
+
+            # Trajectory completion: last chunk succeeded.
+            # _handle_chunk_continuation (called inside env.step()) clears
+            # success_buf for non-last chunks, so success_buf=1 means the
+            # last chunk was reached and completed.
+            newly_completed = (env.success_buf[:num_trajs] == 1) & traj_alive
+            traj_alive[newly_completed] = False
+
+            # Prevent reset_done from firing during eval
+            env.reset_buf[:num_trajs] = 0
+
+        # --- Compute metrics ---
+        valid = traj_steps.clamp(min=1).float()
+        traj_E_j = traj_E_j_sum / valid
+        traj_E_ft = traj_E_ft_sum / valid
+        traj_E_wrist = traj_E_wrist_sum / valid
+
+        # SR: trajectory survived if steps == total_frames (completed all chunks)
+        traj_SR = (traj_steps >= traj_total_frames - 3).float()
+        # CR: completion ratio
+        traj_CR = traj_steps.float() / traj_total_frames.float().clamp(min=1)
+
+        # --- Log to TensorBoard ---
+        prefix = "eval/test_traj"
+        self.writer.add_scalar(f"{prefix}/SR", traj_SR.mean().item(), global_frame)
+        self.writer.add_scalar(f"{prefix}/CR", traj_CR.mean().item(), global_frame)
+        self.writer.add_scalar(f"{prefix}/E_j_mm", traj_E_j.mean().item() * 1000, global_frame)
+        self.writer.add_scalar(f"{prefix}/E_ft_mm", traj_E_ft.mean().item() * 1000, global_frame)
+        self.writer.add_scalar(f"{prefix}/E_wrist_pos_mm", traj_E_wrist.mean().item() * 1000, global_frame)
+        self.writer.add_scalar(f"{prefix}/E_j_mm_median", traj_E_j.median().item() * 1000, global_frame)
+        self.writer.add_scalar(f"{prefix}/E_ft_mm_median", traj_E_ft.median().item() * 1000, global_frame)
+        self.writer.add_scalar(f"{prefix}/E_j_mm_worst", traj_E_j.max().item() * 1000, global_frame)
+        self.writer.add_scalar(f"{prefix}/E_ft_mm_worst", traj_E_ft.max().item() * 1000, global_frame)
+
+        # --- Save per-trajectory JSON ---
+        eval_dir = os.path.join(self.nn_dir, "eval")
+        os.makedirs(eval_dir, exist_ok=True)
+        json_path = os.path.join(eval_dir, f"traj_eval_epoch_{epoch_num}.json")
+        records = []
+        for i in range(num_trajs):
+            records.append({
+                "traj_idx": i,
+                "num_chunks": len(env._test_trajectory_chunks[i]),
+                "total_frames": int(traj_total_frames[i].item()),
+                "completed_frames": int(traj_steps[i].item()),
+                "E_j_mm": round(traj_E_j[i].item() * 1000, 2),
+                "E_ft_mm": round(traj_E_ft[i].item() * 1000, 2),
+                "E_wrist_pos_mm": round(traj_E_wrist[i].item() * 1000, 2),
+                "SR": int(traj_SR[i].item()),
+                "CR": round(traj_CR[i].item(), 4),
+            })
+        with open(json_path, "w") as f:
+            json.dump(records, f, indent=2)
+
+        # --- Cleanup ---
+        env.random_state_init = orig_rsi
+        env.restore_training_state()
+
+        return {"traj_SR": traj_SR, "traj_CR": traj_CR, "traj_E_j": traj_E_j, "traj_E_ft": traj_E_ft}
 
     def play_steps(self):
         update_list = self.update_list
@@ -1443,6 +1610,45 @@ class MyContinuousA2CBase(MyA2CBase):
                                 print("Maximum reward achieved. Network won!")
                                 self.save(os.path.join(self.nn_dir, checkpoint_name))
                                 should_exit = True
+
+                # Log chunk/sequence metrics periodically (Track 1 & Track 2)
+                if epoch_num % self.chunk_metrics_log_every == 0:
+                    env = self.vec_env.env
+                    if hasattr(env, 'get_track1_summary'):
+                        track1 = env.get_track1_summary()
+                        track2 = env.get_track2_summary()
+                        for k, v in {**track1, **track2}.items():
+                            self.writer.add_scalar(k, v, frame)
+
+                        # Curriculum: recompute combined two-level sampling weights
+                        if self.curriculum_enabled and hasattr(env, '_recompute_sampling_weights'):
+                            env._recompute_sampling_weights()
+
+                        # Log weight stats
+                        if hasattr(env, 'sampling_weights') and env.sampling_weights is not None:
+                            w = env.sampling_weights
+                            self.writer.add_scalar("curriculum/weight_mean", w.mean().item(), frame)
+                            self.writer.add_scalar("curriculum/weight_std", w.std().item(), frame)
+                            self.writer.add_scalar("curriculum/weight_max", w.max().item(), frame)
+                            self.writer.add_scalar("curriculum/weight_min", w.min().item(), frame)
+                        # Log trajectory blend weight stats
+                        if hasattr(env, '_traj_blend_weights'):
+                            tw = env._traj_blend_weights
+                            self.writer.add_scalar("curriculum/traj_weight_mean", tw.mean().item(), frame)
+                            self.writer.add_scalar("curriculum/traj_weight_std", tw.std().item(), frame)
+                            self.writer.add_scalar("curriculum/traj_weight_max", tw.max().item(), frame)
+                            self.writer.add_scalar("curriculum/traj_weight_min", tw.min().item(), frame)
+
+                # Periodic evaluation: trajectory-level on test set
+                if epoch_num > 0 and epoch_num % self.eval_every == 0:
+                    eval_env = self.vec_env.env
+                    if hasattr(eval_env, 'cache_training_state'):
+                        self._run_trajectory_eval(eval_env, frame, epoch_num)
+
+                if epoch_num % self.chunk_metrics_log_every == 0:
+                    env = self.vec_env.env
+                    if hasattr(env, 'reset_chunk_metrics'):
+                        env.reset_chunk_metrics()
 
                 if epoch_num >= self.early_stop_epochs:
                     slope_early_stop = True

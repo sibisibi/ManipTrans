@@ -117,6 +117,7 @@ class SepDictObsNetwork(nn.Module):
                     sigma = mu * 0.0 + self.sigma_act(self.sigma)
                 else:
                     sigma = self.sigma_act(self.sigma(a_out))
+                sigma = torch.clamp(sigma, min=-6.9, max=-0.69)
 
                 return mu, sigma, value, states
         else:
@@ -174,6 +175,7 @@ class SepDictObsNetwork(nn.Module):
                     sigma = self.sigma_act(self.sigma)
                 else:
                     sigma = self.sigma_act(self.sigma(out))
+                sigma = torch.clamp(sigma, min=-6.9, max=-0.69)
                 return mu, mu * 0 + sigma, value, states
 
 

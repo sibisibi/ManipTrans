@@ -108,6 +108,13 @@ class DexHandImitatorRHEnv(VecTask):
         self.tighten_factor = self.cfg["env"]["tightenFactor"]
         self.tighten_steps = self.cfg["env"]["tightenSteps"]
 
+        # Two-level hierarchical sampling config
+        self.traj_blend_alpha = self.cfg["env"].get("trajBlendAlpha", 0.1)
+        self.bin_ema_alpha = self.cfg["env"].get("binEmaAlpha", 0.001)
+        self.sonic_blend_alpha = self.cfg["env"].get("sonicBlendAlpha", 0.1)
+        self.sonic_cap_beta = self.cfg["env"].get("sonicCapBeta", 200.0)
+        self.bin_conv_lambda = self.cfg["env"].get("binConvLambda", 0.8)
+
         # Tensor placeholders
         self._root_state = None  # State of root body        (n_envs, 13)
         self._dof_state = None  # State of all joints       (n_envs, n_dof)
@@ -163,8 +170,9 @@ class DexHandImitatorRHEnv(VecTask):
             bps_type="grid_sphere", n_bps_points=128, radius=0.2, randomize=False, device=self.device
         )
 
-        obj_verts = self.demo_data["obj_verts"]
-        self.obj_bps = self.bps_layer.encode(obj_verts, feature_type=self.bps_feat_type)[self.bps_feat_type]
+        if "obj_verts" in self.demo_data:
+            obj_verts = self.demo_data["obj_verts"]
+            self.obj_bps = self.bps_layer.encode(obj_verts, feature_type=self.bps_feat_type)[self.bps_feat_type]
 
         # Reset all environments
         self.reset_idx(torch.arange(self.num_envs, device=self.device))
@@ -232,16 +240,58 @@ class DexHandImitatorRHEnv(VecTask):
         )
 
         index_path = self.cfg["env"].get("indexPath", "")
+        self._precomputed_pt = None
         if index_path:
-            # index_path mode: create dataset directly, use all sequences
             data_dir = self.cfg["env"].get("dataDir", "")
             assert data_dir, "dataDir must be set when using indexPath"
-            self.demo_dataset = ManipDataFactory.create_data(
-                manipdata_type="handphuma",
-                data_dir=data_dir,
-                index_path=index_path,
-                **create_kwargs,
-            )
+
+            # Try pre-computed .pt fast path (supports comma-separated list)
+            pt_paths = [p.strip() for p in index_path.split(",")]
+            if all(p.endswith(".pt") for p in pt_paths):
+                pt_list = []
+                for pt_rel in pt_paths:
+                    pt_path = os.path.join(data_dir, pt_rel)
+                    print(f"Loading pre-computed .pt: {pt_path}")
+                    pt_data = torch.load(pt_path, map_location="cpu", weights_only=False)
+                    if "motion_num_frames" not in pt_data:
+                        print("  Old .pt format detected, falling back to dataset")
+                        pt_list = []
+                        break
+                    print(f"  {len(pt_data['motion_num_frames']):,} chunks, "
+                          f"{pt_data['wrist_pos'].shape[0]:,} frames")
+                    pt_list.append(pt_data)
+
+                if len(pt_list) == 1:
+                    self._precomputed_pt = pt_list[0]
+                elif len(pt_list) > 1:
+                    # Concatenate multiple .pt files
+                    temporal_keys = ["wrist_pos", "wrist_rot", "wrist_velocity",
+                                     "wrist_angular_velocity", "mano_joints", "mano_joints_velocity"]
+                    merged = {}
+                    for k in temporal_keys:
+                        merged[k] = torch.cat([p[k] for p in pt_list], dim=0)
+                    merged["motion_num_frames"] = torch.cat([p["motion_num_frames"] for p in pt_list])
+                    # Recompute length_starts from merged motion_num_frames
+                    nf = merged["motion_num_frames"]
+                    ls = torch.zeros(len(nf), dtype=torch.int64)
+                    if len(nf) > 1:
+                        ls[1:] = torch.cumsum(nf[:-1], dim=0)
+                    merged["length_starts"] = ls
+                    for k in ["datasets", "filenames", "splits"]:
+                        merged[k] = sum([p[k] for p in pt_list], [])
+                    self._precomputed_pt = merged
+                    total_chunks = len(merged["motion_num_frames"])
+                    total_frames = merged["wrist_pos"].shape[0]
+                    print(f"Merged {len(pt_list)} .pt files: {total_chunks:,} chunks, {total_frames:,} frames")
+
+            if self._precomputed_pt is None:
+                # index_path mode: create dataset directly, use all sequences
+                self.demo_dataset = ManipDataFactory.create_data(
+                    manipdata_type="handphuma",
+                    data_dir=data_dir,
+                    index_path=index_path,
+                    **create_kwargs,
+                )
         else:
             # Legacy dataIndices mode
             data_dir = self.cfg["env"].get("dataDir", "")
@@ -331,14 +381,60 @@ class DexHandImitatorRHEnv(VecTask):
         self.dexhands = []
         self.envs = []
 
-        if hasattr(self, 'demo_dataset'):
-            # index_path mode: use all sequences from the dataset
-            num_sequences = len(self.demo_dataset)
-            assert num_sequences > 0, "Dataset is empty"
-            assert num_sequences == 1 or not self.rollout_state_init, "rollout_state_init only works with one data"
+        if self._precomputed_pt is not None:
+            # Pre-computed .pt fast path: bypass dataset + __getitem__ entirely
+            pt = self._precomputed_pt
+            num_chunks = len(pt["motion_num_frames"])
+            assert num_chunks > 0, "Pre-computed .pt is empty"
+            assert num_chunks == 1 or not self.rollout_state_init, "rollout_state_init only works with one data"
 
-            def segment_data(k):
-                return self.demo_dataset[k % num_sequences]
+            self.motion_num_frames = pt["motion_num_frames"].to(self.device)
+            self.length_starts = pt["length_starts"].to(self.device)
+
+            self.demo_data = {
+                "wrist_pos": pt["wrist_pos"].to(self.device),
+                "wrist_rot": pt["wrist_rot"].to(self.device),
+                "wrist_velocity": pt["wrist_velocity"].to(self.device),
+                "wrist_angular_velocity": pt["wrist_angular_velocity"].to(self.device),
+                "mano_joints": pt["mano_joints"].to(self.device),
+                "mano_joints_velocity": pt["mano_joints_velocity"].to(self.device),
+            }
+
+            # Lightweight proxy for demo_dataset.sequences (needed for chunk-to-seq mapping)
+            class _SeqProxy:
+                def __init__(self, datasets, filenames, splits):
+                    self.sequences = [
+                        {"dataset": d, "filename": f, "split": s}
+                        for d, f, s in zip(datasets, filenames, splits)
+                    ]
+                def __len__(self):
+                    return len(self.sequences)
+            self.demo_dataset = _SeqProxy(pt["datasets"], pt["filenames"], pt["splits"])
+
+            del self._precomputed_pt
+
+            self.num_chunks = num_chunks
+            self.sampling_weights = torch.ones(num_chunks, device=self.device)
+            self.motion_ids = torch.multinomial(
+                self.sampling_weights, self.num_envs, replacement=True
+            )
+            print(f"Pre-computed .pt loaded: {num_chunks:,} chunks, "
+                  f"{self.demo_data['wrist_pos'].shape[0]:,} frames (instant)")
+        elif hasattr(self, 'demo_dataset'):
+            # index_path mode: load ALL chunks once, enable dynamic weighted sampling
+            num_chunks = len(self.demo_dataset)
+            assert num_chunks > 0, "Dataset is empty"
+            assert num_chunks == 1 or not self.rollout_state_init, "rollout_state_init only works with one data"
+
+            all_chunks = [self.demo_dataset[i] for i in tqdm(range(num_chunks))]
+            self.demo_data = self.pack_data_flat(all_chunks)  # flat storage: [total_frames, ...]
+
+            # Dynamic weighted sampling state
+            self.num_chunks = num_chunks
+            self.sampling_weights = torch.ones(num_chunks, device=self.device)
+            self.motion_ids = torch.multinomial(
+                self.sampling_weights, self.num_envs, replacement=True
+            )
         else:
             # Legacy dataIndices mode
             assert len(self.dataIndices) == 1 or not self.rollout_state_init, "rollout_state_init only works with one data"
@@ -349,8 +445,74 @@ class DexHandImitatorRHEnv(VecTask):
                 idx = todo_list[k % len(todo_list)]
                 return self.demo_dataset_dict[ManipDataFactory.dataset_type(idx)][idx]
 
-        self.demo_data = [segment_data(i) for i in tqdm(range(self.num_envs))]
-        self.demo_data = self.pack_data(self.demo_data)
+            self.demo_data = [segment_data(i) for i in tqdm(range(self.num_envs))]
+            self.demo_data = self.pack_data_flat(self.demo_data)
+
+            # Legacy mode: identity mapping (motion_ids[i] == i), no dynamic sampling
+            self.num_chunks = self.num_envs
+            self.sampling_weights = None
+            self.motion_ids = torch.arange(self.num_envs, dtype=torch.long, device=self.device)
+
+        # Per-chunk metrics (Track 1) and chunk-to-sequence mapping (Track 2)
+        if self.sampling_weights is not None:
+            self.chunk_success_count = torch.zeros(self.num_chunks, device=self.device)
+            self.chunk_fail_count = torch.zeros(self.num_chunks, device=self.device)
+            self.chunk_eval_count = torch.zeros(self.num_chunks, device=self.device)
+            self.chunk_completion_sum = torch.zeros(self.num_chunks, device=self.device)
+            self.chunk_reward_sum = torch.zeros(self.num_chunks, device=self.device)
+
+            # Build chunk-to-sequence mapping from CSV data
+            seq_key_to_id = {}
+            chunk_to_seq_list = []
+            for seq_info in self.demo_dataset.sequences:
+                key = (seq_info["dataset"], seq_info["filename"])
+                if key not in seq_key_to_id:
+                    seq_key_to_id[key] = len(seq_key_to_id)
+                chunk_to_seq_list.append(seq_key_to_id[key])
+            self.chunk_to_seq = torch.tensor(chunk_to_seq_list, dtype=torch.long, device=self.device)
+            self.num_sequences = len(seq_key_to_id)
+            self.chunk_duration_frames = self.motion_num_frames.clone()
+
+            # Parse split column from CSV for evaluation
+            train_idx = []
+            test_idx = []
+            for i, seq_info in enumerate(self.demo_dataset.sequences):
+                split = seq_info.get("split", "train")
+                if split == "test":
+                    test_idx.append(i)
+                else:
+                    train_idx.append(i)
+            self._train_chunk_indices = torch.tensor(train_idx, dtype=torch.long, device=self.device)
+            self._test_chunk_indices = torch.tensor(test_idx, dtype=torch.long, device=self.device)
+
+            # === Two-level sampling state ===
+
+            # Bin-level state (BeyondMimic + SONIC)
+            # Each chunk IS a 1-second bin, so bin_failed_count is per-chunk
+            self.bin_failed_count = torch.zeros(self.num_chunks, device=self.device)
+            # Precompute: number of chunks per sequence (for uniform floor)
+            self.chunks_per_seq = torch.zeros(self.num_sequences, device=self.device)
+            self.chunks_per_seq.scatter_add_(
+                0, self.chunk_to_seq,
+                torch.ones(self.num_chunks, device=self.device)
+            )
+
+            # Cross-chunk continuation: link each chunk to its successor in the trajectory.
+            # Chunks within the same sequence are consecutive in the flat array
+            # (chunk_index.py generates them in chunk_id order per trajectory).
+            self.next_chunk = torch.full((self.num_chunks,), -1, dtype=torch.long, device=self.device)
+            if self.num_chunks > 1:
+                same_seq = self.chunk_to_seq[:-1] == self.chunk_to_seq[1:]
+                link_indices = torch.arange(self.num_chunks - 1, device=self.device)[same_seq]
+                self.next_chunk[link_indices] = link_indices + 1
+
+
+            # Initial combined weights (starts as uniform)
+            self._recompute_sampling_weights()
+        else:
+            # Legacy mode: no split info, all chunks are "train"
+            self._train_chunk_indices = torch.arange(self.num_chunks, dtype=torch.long, device=self.device)
+            self._test_chunk_indices = torch.tensor([], dtype=torch.long, device=self.device)
 
         # Create environments
         num_per_row = int(np.sqrt(self.num_envs))
@@ -542,6 +704,60 @@ class DexHandImitatorRHEnv(VecTask):
 
         return packed_data
 
+    def pack_data_flat(self, data):
+        """Pack data as flat concatenated tensors (ProtoMotions-style).
+
+        Instead of padding all chunks to max_len and stacking into [num_chunks, max_len, ...],
+        this concatenates all chunks into flat [total_frames, ...] tensors and uses
+        length_starts offsets for indexing.
+        """
+        flat_data = {}
+
+        # Compute per-chunk frame counts
+        frame_counts = [len(d["obj_trajectory"]) for d in data]
+        motion_num_frames = torch.tensor(frame_counts, dtype=torch.long, device=self.device)
+
+        # Compute length_starts (exclusive cumsum)
+        lengths_shifted = motion_num_frames.roll(1)
+        lengths_shifted[0] = 0
+        length_starts = lengths_shifted.cumsum(0)
+
+        self.motion_num_frames = motion_num_frames
+        self.length_starts = length_starts
+
+        # Temporal fields: torch.cat across chunks → [total_frames, ...]
+        temporal_keys = [
+            "wrist_pos", "wrist_rot", "wrist_velocity", "wrist_angular_velocity",
+            "obj_trajectory", "obj_velocity", "obj_angular_velocity", "tips_distance",
+        ]
+
+        for k in temporal_keys:
+            if k in data[0]:
+                flat_data[k] = torch.cat([d[k] for d in data], dim=0).to(self.device)
+
+        # mano_joints and mano_joints_velocity: apply joint name concatenation, then cat
+        for k in ["mano_joints", "mano_joints_velocity"]:
+            if k in data[0]:
+                chunks = []
+                for d in data:
+                    chunks.append(
+                        torch.concat(
+                            [
+                                d[k][self.dexhand.to_hand(j_name)[0]]
+                                for j_name in self.dexhand.body_names
+                                if self.dexhand.to_hand(j_name)[0] != "wrist"
+                            ],
+                            dim=-1,
+                        )
+                    )
+                flat_data[k] = torch.cat(chunks, dim=0).to(self.device)
+
+        # obj_verts: non-temporal, stack as [num_chunks, 1000, 3]
+        if "obj_verts" in data[0]:
+            flat_data["obj_verts"] = torch.stack([d["obj_verts"] for d in data]).squeeze().to(self.device)
+
+        return flat_data
+
     def allocate_buffers(self):
         # will also allocate extra buffers for data dumping, used for distillation
         super().allocate_buffers()
@@ -587,20 +803,22 @@ class DexHandImitatorRHEnv(VecTask):
 
     def compute_reward(self, actions):
         target_state = {}
-        max_length = torch.clip(self.demo_data["seq_len"], 0, self.max_episode_length).float()
+        max_length = torch.clip(self.motion_num_frames[self.motion_ids], 0, self.max_episode_length).float()
         cur_idx = self.progress_buf
-        cur_wrist_pos = self.demo_data["wrist_pos"][torch.arange(self.num_envs), cur_idx]
+        cur_idx = torch.clamp(cur_idx, max=self.motion_num_frames[self.motion_ids] - 1)
+        flat_idx = cur_idx + self.length_starts[self.motion_ids]
+        cur_wrist_pos = self.demo_data["wrist_pos"][flat_idx]
         target_state["wrist_pos"] = cur_wrist_pos
-        cur_wrist_rot = self.demo_data["wrist_rot"][torch.arange(self.num_envs), cur_idx]
+        cur_wrist_rot = self.demo_data["wrist_rot"][flat_idx]
         target_state["wrist_quat"] = aa_to_quat(cur_wrist_rot)[:, [1, 2, 3, 0]]
 
-        target_state["wrist_vel"] = self.demo_data["wrist_velocity"][torch.arange(self.num_envs), cur_idx]
-        target_state["wrist_ang_vel"] = self.demo_data["wrist_angular_velocity"][torch.arange(self.num_envs), cur_idx]
+        target_state["wrist_vel"] = self.demo_data["wrist_velocity"][flat_idx]
+        target_state["wrist_ang_vel"] = self.demo_data["wrist_angular_velocity"][flat_idx]
 
-        cur_joints_pos = self.demo_data["mano_joints"][torch.arange(self.num_envs), cur_idx]
+        cur_joints_pos = self.demo_data["mano_joints"][flat_idx]
         target_state["joints_pos"] = cur_joints_pos.reshape(self.num_envs, -1, 3)
         target_state["joints_vel"] = self.demo_data["mano_joints_velocity"][
-            torch.arange(self.num_envs), cur_idx
+            flat_idx
         ].reshape(self.num_envs, -1, 3)
 
         power = torch.abs(torch.multiply(self.dof_force, self.states["dq"])).sum(dim=-1)
@@ -660,6 +878,72 @@ class DexHandImitatorRHEnv(VecTask):
         )
         self.total_rew_buf += self.rew_buf
 
+    def compute_eval_metrics(self):
+        """Compute raw tracking errors for evaluation. NOT for reward — raw L2 errors."""
+        cur_idx = self.progress_buf
+        # Clamp to valid range using flat-concat metadata
+        cur_idx = torch.clamp(cur_idx, max=self.motion_num_frames[self.motion_ids] - 1)
+        flat_idx = cur_idx + self.length_starts[self.motion_ids]
+
+        # Reference positions (same fields as compute_reward, lines 680-691)
+        ref_wrist_pos = self.demo_data["wrist_pos"][flat_idx]
+        ref_wrist_rot = self.demo_data["wrist_rot"][flat_idx]
+        ref_joints_pos = self.demo_data["mano_joints"][flat_idx].reshape(self.num_envs, -1, 3)
+
+        # Current simulated state (same as compute_imitation_reward, lines 1317-1318, 1333)
+        sim_wrist_pos = self.states["base_state"][:, :3]
+        sim_wrist_quat = self.states["base_state"][:, 3:7]
+        sim_joints_pos = self.states["joints_state"][:, 1:, :3]  # skip base joint
+
+        # Per-joint L2 errors (meters)
+        diff_joints_pos_dist = torch.norm(ref_joints_pos - sim_joints_pos, dim=-1)  # [num_envs, num_joints]
+
+        # Per-joint-group errors (same index mapping as compute_imitation_reward, lines 1339-1345)
+        thumb_err = diff_joints_pos_dist[:, [k - 1 for k in self.dexhand.weight_idx["thumb_tip"]]].mean(dim=-1)
+        index_err = diff_joints_pos_dist[:, [k - 1 for k in self.dexhand.weight_idx["index_tip"]]].mean(dim=-1)
+        middle_err = diff_joints_pos_dist[:, [k - 1 for k in self.dexhand.weight_idx["middle_tip"]]].mean(dim=-1)
+        ring_err = diff_joints_pos_dist[:, [k - 1 for k in self.dexhand.weight_idx["ring_tip"]]].mean(dim=-1)
+        pinky_err = diff_joints_pos_dist[:, [k - 1 for k in self.dexhand.weight_idx["pinky_tip"]]].mean(dim=-1)
+        level_1_err = diff_joints_pos_dist[:, [k - 1 for k in self.dexhand.weight_idx["level_1_joints"]]].mean(dim=-1)
+        level_2_err = diff_joints_pos_dist[:, [k - 1 for k in self.dexhand.weight_idx["level_2_joints"]]].mean(dim=-1)
+
+        # Wrist errors
+        E_wrist_pos = torch.norm(ref_wrist_pos - sim_wrist_pos, dim=-1)  # [num_envs], meters
+        ref_wrist_quat = aa_to_quat(ref_wrist_rot)[:, [1, 2, 3, 0]]  # match ManipTrans convention (line 683)
+        diff_rot = quat_mul(ref_wrist_quat, quat_conjugate(sim_wrist_quat))
+        E_wrist_rot = quat_to_angle_axis(diff_rot)[0]  # radians
+
+        # Aggregate: mean joint error, mean fingertip error
+        E_j = diff_joints_pos_dist.mean(dim=-1)  # [num_envs]
+        E_ft = torch.stack([thumb_err, index_err, middle_err, ring_err, pinky_err], dim=-1).mean(dim=-1)  # [num_envs]
+
+        # FIXED termination thresholds (tightened end-state: base_value / 0.7 * 0.7 = base_value)
+        # These match compute_imitation_reward lines 1381-1389 at scale_factor = 0.7
+        failed = (
+            (thumb_err > 0.04)
+            | (index_err > 0.045)
+            | (middle_err > 0.05)
+            | (ring_err > 0.06)
+            | (pinky_err > 0.06)
+            | (level_1_err > 0.07)
+            | (level_2_err > 0.08)
+        )
+
+        return {
+            "E_j": E_j,                    # [num_envs], meters
+            "E_ft": E_ft,                  # [num_envs], meters
+            "E_wrist_pos": E_wrist_pos,    # [num_envs], meters
+            "E_wrist_rot": E_wrist_rot,    # [num_envs], radians
+            "thumb_err": thumb_err,
+            "index_err": index_err,
+            "middle_err": middle_err,
+            "ring_err": ring_err,
+            "pinky_err": pinky_err,
+            "level_1_err": level_1_err,
+            "level_2_err": level_2_err,
+            "failed": failed,              # [num_envs], bool
+        }
+
     def compute_observations(self):
         self._refresh()
         # obs_keys: q, cos_q, sin_q, base_state
@@ -703,22 +987,20 @@ class DexHandImitatorRHEnv(VecTask):
         next_target_state = {}
 
         cur_idx = self.progress_buf + 1
-        cur_idx = torch.clamp(cur_idx, torch.zeros_like(self.demo_data["seq_len"]), self.demo_data["seq_len"] - 1)
+        seq_len = self.motion_num_frames[self.motion_ids]
+        cur_idx = torch.clamp(cur_idx, torch.zeros_like(seq_len), seq_len - 1)
 
         cur_idx = torch.stack(
-            [cur_idx + t for t in range(self.obs_future_length)], dim=-1
+            [torch.clamp(cur_idx + t, max=seq_len - 1) for t in range(self.obs_future_length)], dim=-1
         )  # [B, K], K = obs_future_length
-        nE, nT = self.demo_data["wrist_pos"].shape[:2]
+        nE = self.num_envs
         nF = self.obs_future_length
 
-        def indicing(data, idx):
-            assert data.shape[0] == nE and data.shape[1] == nT
-            remaining_shape = data.shape[2:]
-            expanded_idx = idx
-            for _ in remaining_shape:
-                expanded_idx = expanded_idx.unsqueeze(-1)
-            expanded_idx = expanded_idx.expand(-1, -1, *remaining_shape)
-            return torch.gather(data, 1, expanded_idx)
+        def indicing(flat_data, idx):
+            # flat_data: [total_frames, ...], idx: [num_envs, K]
+            offsets = self.length_starts[self.motion_ids].unsqueeze(1)  # [num_envs, 1]
+            flat_idx = idx + offsets  # [num_envs, K]
+            return flat_data[flat_idx]  # [num_envs, K, ...]
 
         target_wrist_pos = indicing(self.demo_data["wrist_pos"], cur_idx)  # [B, K, 3]
         cur_wrist_pos = self.states["base_state"][:, :3]  # [B, 3]
@@ -780,12 +1062,20 @@ class DexHandImitatorRHEnv(VecTask):
         return self.obs_dict
 
     def _reset_default(self, env_ids):
+        # Sample new chunks for resetting envs (dynamic weighted sampling)
+        if self.sampling_weights is not None:
+            new_ids = torch.multinomial(
+                self.sampling_weights, len(env_ids), replacement=True
+            )
+            self.motion_ids[env_ids] = new_ids
+
+        chunk_seq_len = self.motion_num_frames[self.motion_ids[env_ids]]
         if self.random_state_init:
             seq_idx = torch.floor(
-                self.demo_data["seq_len"][env_ids] * 0.99 * torch.rand_like(self.demo_data["seq_len"][env_ids].float())
+                chunk_seq_len * 0.99 * torch.rand_like(chunk_seq_len.float())
             ).long()
         else:
-            seq_idx = torch.zeros_like(self.demo_data["seq_len"][env_ids].long())
+            seq_idx = torch.zeros_like(chunk_seq_len.long())
 
         noise_dof_pos = (
             torch.randn_like(self.dexhand_default_dof_pos[None].repeat(len(env_ids), 1))
@@ -805,9 +1095,10 @@ class DexHandImitatorRHEnv(VecTask):
             self._dexhand_dof_speed_limits.unsqueeze(0),
         )
 
-        opt_wrist_pos = self.demo_data["wrist_pos"][env_ids, seq_idx]
+        reset_flat_idx = seq_idx + self.length_starts[self.motion_ids[env_ids]]
+        opt_wrist_pos = self.demo_data["wrist_pos"][reset_flat_idx]
         opt_wrist_pos = opt_wrist_pos + torch.randn_like(opt_wrist_pos) * 0.01
-        opt_wrist_rot_aa = self.demo_data["wrist_rot"][env_ids, seq_idx]
+        opt_wrist_rot_aa = self.demo_data["wrist_rot"][reset_flat_idx]
         opt_wrist_rot = aa_to_rotmat(opt_wrist_rot_aa)
         noise_rot = torch.rand(opt_wrist_rot.shape[0], 3, device=self.device)
         noise_rot = aa_to_rotmat(
@@ -820,9 +1111,9 @@ class DexHandImitatorRHEnv(VecTask):
         opt_wrist_rot = rotmat_to_quat(opt_wrist_rot)
         opt_wrist_rot = opt_wrist_rot[:, [1, 2, 3, 0]]
 
-        opt_wrist_vel = self.demo_data["wrist_velocity"][env_ids, seq_idx]
+        opt_wrist_vel = self.demo_data["wrist_velocity"][reset_flat_idx]
         opt_wrist_vel = opt_wrist_vel + torch.randn_like(opt_wrist_vel) * 0.01
-        opt_wrist_ang_vel = self.demo_data["wrist_angular_velocity"][env_ids, seq_idx]
+        opt_wrist_ang_vel = self.demo_data["wrist_angular_velocity"][reset_flat_idx]
         opt_wrist_ang_vel = opt_wrist_ang_vel + torch.randn_like(opt_wrist_ang_vel) * 0.01
 
         opt_hand_pose_vel = torch.concat([opt_wrist_pos, opt_wrist_rot, opt_wrist_vel, opt_wrist_ang_vel], dim=-1)
@@ -907,10 +1198,12 @@ class DexHandImitatorRHEnv(VecTask):
         if not self.headless:
 
             cur_idx = self.progress_buf
+            cur_idx = torch.clamp(cur_idx, max=self.motion_num_frames[self.motion_ids] - 1)
 
-            cur_wrist_pos = self.demo_data["wrist_pos"][torch.arange(self.num_envs), cur_idx]
+            viz_flat_idx = cur_idx + self.length_starts[self.motion_ids]
+            cur_wrist_pos = self.demo_data["wrist_pos"][viz_flat_idx]
 
-            cur_mano_joint_pos = self.demo_data["mano_joints"][torch.arange(self.num_envs), cur_idx].reshape(
+            cur_mano_joint_pos = self.demo_data["mano_joints"][viz_flat_idx].reshape(
                 self.num_envs, -1, 3
             )
             cur_mano_joint_pos = torch.concat([cur_wrist_pos[:, None], cur_mano_joint_pos], dim=1)
@@ -1010,9 +1303,387 @@ class DexHandImitatorRHEnv(VecTask):
         self.compute_observations()
         self.compute_reward(self.actions)
 
+        # Update chunk metrics for terminated episodes (before motion_ids change)
+        if self.sampling_weights is not None:
+            done_env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
+            self.update_chunk_metrics(done_env_ids)
+            self.update_bin_failures(done_env_ids)
+
+            # Cross-chunk continuation: advance non-last chunks instead of resetting.
+            # Must be AFTER metrics (so chunk completion is recorded) and
+            # BEFORE progress_buf increment (so -1 becomes 0).
+            self._handle_chunk_continuation()
+
         self.progress_buf += 1
         self.running_progress_buf += 1
         self.randomize_buf += 1
+
+    def update_chunk_metrics(self, done_env_ids):
+        """Update per-chunk metrics for terminated episodes."""
+        if len(done_env_ids) == 0:
+            return
+        chunk_ids = self.motion_ids[done_env_ids]
+
+        # Scatter-add success/fail/count
+        self.chunk_eval_count.scatter_add_(0, chunk_ids, torch.ones_like(chunk_ids, dtype=torch.float))
+        self.chunk_success_count.scatter_add_(0, chunk_ids, self.success_buf[done_env_ids].float())
+        self.chunk_fail_count.scatter_add_(0, chunk_ids, self.failure_buf[done_env_ids].float())
+
+        # Completion fraction
+        seq_lens = self.motion_num_frames[chunk_ids].float()
+        completion = self.progress_buf[done_env_ids].float() / seq_lens.clamp(min=1)
+        self.chunk_completion_sum.scatter_add_(0, chunk_ids, completion)
+
+    def get_chunk_metrics(self):
+        """Return per-chunk metrics dict."""
+        eval_count = self.chunk_eval_count.clamp(min=1)
+        return {
+            "chunk_success_rate": self.chunk_success_count / eval_count,
+            "chunk_fail_rate": self.chunk_fail_count / eval_count,
+            "chunk_completion_frac": self.chunk_completion_sum / eval_count,
+            "chunk_eval_count": self.chunk_eval_count,
+        }
+
+    def get_track1_summary(self):
+        """Track 1: Duration-weighted chunk-level summary."""
+        metrics = self.get_chunk_metrics()
+        evaluated = self.chunk_eval_count > 0
+        if not evaluated.any():
+            return {}
+
+        durations = self.chunk_duration_frames[evaluated].float()
+        weights = durations / durations.sum()
+
+        return {
+            "track1/weighted_success_rate": (weights * metrics["chunk_success_rate"][evaluated]).sum().item(),
+            "track1/weighted_completion": (weights * metrics["chunk_completion_frac"][evaluated]).sum().item(),
+            "track1/chunks_evaluated": evaluated.sum().item(),
+            "track1/chunks_total": self.num_chunks,
+        }
+
+    def get_track2_summary(self):
+        """Track 2: Per-sequence success rate (unbiased across sequences)."""
+        metrics = self.get_chunk_metrics()
+
+        # Aggregate chunks to sequences via scatter
+        seq_weighted_success = torch.zeros(self.num_sequences, device=self.device)
+        seq_total_duration = torch.zeros(self.num_sequences, device=self.device)
+
+        weighted_success = self.chunk_duration_frames.float() * metrics["chunk_success_rate"]
+        seq_weighted_success.scatter_add_(0, self.chunk_to_seq, weighted_success)
+        seq_total_duration.scatter_add_(0, self.chunk_to_seq, self.chunk_duration_frames.float())
+
+        seq_success_rate = seq_weighted_success / seq_total_duration.clamp(min=1)
+
+        # Only count sequences with at least one evaluated chunk
+        seq_eval_count = torch.zeros(self.num_sequences, device=self.device)
+        seq_eval_count.scatter_add_(0, self.chunk_to_seq, (self.chunk_eval_count > 0).float())
+        evaluated_seqs = seq_eval_count > 0
+
+        if not evaluated_seqs.any():
+            return {}
+
+        return {
+            "track2/seq_mean_success_rate": seq_success_rate[evaluated_seqs].mean().item(),
+            "track2/seq_worst_success_rate": seq_success_rate[evaluated_seqs].min().item(),
+            "track2/seq_best_success_rate": seq_success_rate[evaluated_seqs].max().item(),
+            "track2/seqs_evaluated": evaluated_seqs.sum().item(),
+            "track2/seqs_total": self.num_sequences,
+        }
+
+    def update_sampling_weights(self):
+        """Update sampling weights: upweight failed chunks, downweight mastered ones."""
+        if self.sampling_weights is None:
+            return
+
+        metrics = self.get_chunk_metrics()
+        eval_count = self.chunk_eval_count
+        evaluated = eval_count > 0
+
+        if not evaluated.any():
+            return
+
+        # Failure-based weighting: chunks with lower success get higher weight
+        # For unevaluated chunks, keep current weight (don't zero them out)
+        success_rate = metrics["chunk_success_rate"]  # [num_chunks]
+
+        # New weight = 1 - success_rate (more failures = higher weight)
+        # Clamp to [min_weight, max_weight] to prevent starvation or domination
+        min_weight = 0.1
+        max_weight = 2.0
+        new_weights = (1.0 - success_rate).clamp(min=min_weight, max=max_weight)
+
+        # Only update weights for chunks that were actually evaluated
+        self.sampling_weights[evaluated] = new_weights[evaluated]
+        # Unevaluated chunks keep their current weight
+
+    # === Two-level hierarchical sampling methods ===
+
+    def update_bin_failures(self, done_env_ids):
+        """BeyondMimic: attribute failures to current chunk, EMA update.
+        Only updates EMA for chunks that were actually observed this step.
+        """
+        if len(done_env_ids) == 0 or self.sampling_weights is None:
+            return
+
+        chunk_ids = self.motion_ids[done_env_ids]
+
+        # Count failures and total terminations per chunk this step
+        failures = self.failure_buf[done_env_ids].float()
+        chunk_fail_this_step = torch.zeros(self.num_chunks, device=self.device)
+        chunk_total_this_step = torch.zeros(self.num_chunks, device=self.device)
+        chunk_fail_this_step.scatter_add_(0, chunk_ids, failures)
+        chunk_total_this_step.scatter_add_(0, chunk_ids, torch.ones_like(failures))
+
+        # Compute per-chunk failure rate for observed chunks
+        observed = chunk_total_this_step > 0
+        fail_rate = chunk_fail_this_step / chunk_total_this_step.clamp(min=1)
+
+        # EMA update only for observed chunks
+        alpha = self.bin_ema_alpha
+        self.bin_failed_count[observed] = (
+            alpha * fail_rate[observed] + (1 - alpha) * self.bin_failed_count[observed]
+        )
+
+    def _handle_chunk_continuation(self):
+        """Cross-chunk continuation: advance to next chunk instead of resetting.
+
+        Called in post_physics_step AFTER update_chunk_metrics and
+        update_bin_failures (so chunk completion is recorded) but BEFORE
+        progress_buf is incremented.
+
+        For envs that completed their chunk (success_buf=1) and have a
+        successor chunk in the same trajectory:
+        - Override reset_buf=0 (prevent reset_done from firing)
+        - Advance motion_ids to the next chunk
+        - Set progress_buf=-1 (becomes 0 after the +=1 in post_physics_step)
+        - Do NOT reset physics state (hand continues from where it is)
+        """
+        if not hasattr(self, 'next_chunk'):
+            return
+
+        continue_mask = (
+            (self.success_buf == 1)
+            & (self.next_chunk[self.motion_ids] >= 0)
+        )
+
+        if not continue_mask.any():
+            return
+
+        continue_ids = continue_mask.nonzero(as_tuple=False).flatten()
+
+        # Override: don't reset these envs
+        self.reset_buf[continue_ids] = 0
+        self.success_buf[continue_ids] = 0
+
+        # Advance to next chunk (NO physics/PID/controller reset)
+        self.motion_ids[continue_ids] = self.next_chunk[self.motion_ids[continue_ids]]
+        self.progress_buf[continue_ids] = -1  # after +=1 → 0 = frame 0 of new chunk
+
+        # Keep running_progress_buf counting: no grace period at chunk boundaries.
+        # The policy must maintain tracking quality across transitions.
+        # (running_progress_buf is only reset on full episode reset in _reset_default)
+
+    def _convolve_within_seq(self, values):
+        """Spread failure blame to preceding chunks within same trajectory.
+        BeyondMimic: chunk i's failure is partially attributed to chunks i-1, i-2.
+        Kernel [lam^2, lam, 1] applied backward (preceding chunks get blame)."""
+        lam = self.bin_conv_lambda
+        out = values.clone()
+
+        # Shift by 1: chunk i-1 receives lam * values[i]
+        if self.num_chunks > 1:
+            shifted1 = torch.zeros_like(values)
+            shifted1[:-1] = values[1:] * lam
+            # Zero out where sequence boundary (different trajectory)
+            same_seq_1 = (self.chunk_to_seq[:-1] == self.chunk_to_seq[1:])
+            shifted1[:-1] *= same_seq_1.float()
+            out += shifted1
+
+        # Shift by 2: chunk i-2 receives lam^2 * values[i]
+        if self.num_chunks > 2:
+            shifted2 = torch.zeros_like(values)
+            shifted2[:-2] = values[2:] * (lam * lam)
+            same_seq_2 = (self.chunk_to_seq[:-2] == self.chunk_to_seq[2:])
+            shifted2[:-2] *= same_seq_2.float()
+            out += shifted2
+
+        return out
+
+    def _recompute_sampling_weights(self):
+        """Recompute combined chunk-level sampling weights from trajectory + bin levels."""
+        if self.sampling_weights is None:
+            return
+
+        # --- Bin-level: BeyondMimic + SONIC blend ---
+        # 1. Adaptive probs: EMA failure counts + uniform floor
+        uniform_floor = 0.1 / self.chunks_per_seq[self.chunk_to_seq].clamp(min=1)
+        adaptive = self.bin_failed_count + uniform_floor
+
+        # 2. Convolve within trajectory (backward blame spread)
+        adaptive = self._convolve_within_seq(adaptive)
+
+        # 3. SONIC cap: cap per-chunk at beta * mean_within_trajectory
+        sum_per_seq = torch.zeros(self.num_sequences, device=self.device)
+        sum_per_seq.scatter_add_(0, self.chunk_to_seq, adaptive)
+        mean_per_seq = sum_per_seq / self.chunks_per_seq.clamp(min=1)
+        cap = self.sonic_cap_beta * mean_per_seq[self.chunk_to_seq]
+        adaptive = torch.clamp(adaptive, max=cap)
+
+        # 4. Normalize within each trajectory
+        norm_sum_per_seq = torch.zeros(self.num_sequences, device=self.device)
+        norm_sum_per_seq.scatter_add_(0, self.chunk_to_seq, adaptive)
+        adaptive_norm = adaptive / norm_sum_per_seq[self.chunk_to_seq].clamp(min=1e-8)
+
+        # 5. SONIC 90/10 blend: 10% adaptive + 90% uniform within trajectory
+        uniform_within_seq = 1.0 / self.chunks_per_seq[self.chunk_to_seq].clamp(min=1)
+        bin_probs = self.sonic_blend_alpha * adaptive_norm + (1 - self.sonic_blend_alpha) * uniform_within_seq
+
+        # --- Trajectory-level: aggregate bin failures per trajectory, normalize, blend ---
+        traj_adaptive = torch.zeros(self.num_sequences, device=self.device)
+        traj_adaptive.scatter_add_(0, self.chunk_to_seq, self.bin_failed_count)
+        traj_adaptive = traj_adaptive / self.chunks_per_seq.clamp(min=1)  # mean per chunk
+
+        traj_sum = traj_adaptive.sum()
+        if traj_sum > 0:
+            traj_adaptive_norm = traj_adaptive / traj_sum
+        else:
+            traj_adaptive_norm = torch.ones(self.num_sequences, device=self.device) / self.num_sequences
+
+        uniform_traj = 1.0 / self.num_sequences
+        traj_blend = self.traj_blend_alpha * traj_adaptive_norm + (1 - self.traj_blend_alpha) * uniform_traj
+        self._traj_blend_weights = traj_blend  # store for logging
+
+        traj_weights_per_chunk = traj_blend[self.chunk_to_seq]
+
+        # --- Combined ---
+        self.sampling_weights[:] = traj_weights_per_chunk * bin_probs
+
+        # Numerical safety: ensure non-negative for torch.multinomial
+        self.sampling_weights.clamp_(min=1e-8)
+
+        # Exclude test chunks from training sampling (after clamp so they stay at 0)
+        if len(self._test_chunk_indices) > 0:
+            self.sampling_weights[self._test_chunk_indices] = 0.0
+
+    def reset_chunk_metrics(self):
+        """Reset all chunk-level metrics (call periodically for windowed stats)."""
+        self.chunk_success_count.zero_()
+        self.chunk_fail_count.zero_()
+        self.chunk_eval_count.zero_()
+        self.chunk_completion_sum.zero_()
+        self.chunk_reward_sum.zero_()
+
+    def get_split_indices(self, split_name):
+        """Return chunk indices for the given split."""
+        if split_name == "test":
+            return self._test_chunk_indices
+        return self._train_chunk_indices
+
+    def _build_test_trajectory_map(self):
+        """Build ordered list of chunk indices per test trajectory.
+
+        Populates:
+            self._test_trajectory_chunks: list of 1-D long tensors, each containing
+                the ordered chunk indices for one test trajectory.
+            self._test_trajectory_total_frames: [num_test_trajectories] long tensor
+                with the total number of frames per trajectory.
+        """
+        if hasattr(self, '_test_trajectory_chunks'):
+            return  # already built
+
+        test_chunks = self._test_chunk_indices  # [num_test_chunks]
+        test_seq_ids = self.chunk_to_seq[test_chunks]  # sequence id per test chunk
+
+        unique_seqs = test_seq_ids.unique(sorted=True)
+        traj_chunks_list = []
+        total_frames_list = []
+
+        for seq_id in unique_seqs:
+            mask = test_seq_ids == seq_id
+            chunks_in_traj = test_chunks[mask]
+            # Sort by chunk index (should already be consecutive, but be safe)
+            chunks_in_traj = chunks_in_traj.sort()[0]
+            traj_chunks_list.append(chunks_in_traj)
+            total_frames_list.append(self.motion_num_frames[chunks_in_traj].sum())
+
+        self._test_trajectory_chunks = traj_chunks_list
+        self._test_trajectory_total_frames = torch.stack(total_frames_list)
+
+    def cache_training_state(self):
+        """Save training state before evaluation."""
+        self._cached_state = {
+            "motion_ids": self.motion_ids.clone(),
+            "progress_buf": self.progress_buf.clone(),
+            "running_progress_buf": self.running_progress_buf.clone(),
+            "reset_buf": self.reset_buf.clone(),
+            "success_buf": self.success_buf.clone(),
+            "failure_buf": self.failure_buf.clone(),
+            "error_buf": self.error_buf.clone(),
+            "total_rew_buf": self.total_rew_buf.clone(),
+            "random_state_init": self.random_state_init,
+            # Physics state
+            "_dof_state": self._dof_state.clone(),
+            "_root_state": self._root_state.clone(),
+            "_pos_control": self._pos_control.clone(),
+            "curr_targets": self.curr_targets.clone(),
+            "prev_targets": self.prev_targets.clone(),
+            "apply_forces": self.apply_forces.clone(),
+            "apply_torque": self.apply_torque.clone(),
+        }
+        # Chunk metrics (prevent eval from polluting training statistics)
+        if self.sampling_weights is not None:
+            self._cached_state["chunk_eval_count"] = self.chunk_eval_count.clone()
+            self._cached_state["chunk_success_count"] = self.chunk_success_count.clone()
+            self._cached_state["chunk_fail_count"] = self.chunk_fail_count.clone()
+            self._cached_state["chunk_completion_sum"] = self.chunk_completion_sum.clone()
+            self._cached_state["chunk_reward_sum"] = self.chunk_reward_sum.clone()
+            self._cached_state["bin_failed_count"] = self.bin_failed_count.clone()
+        # PID state if applicable
+        if self.use_pid_control:
+            self._cached_state["prev_pos_error"] = self.prev_pos_error.clone()
+            self._cached_state["prev_rot_error"] = self.prev_rot_error.clone()
+            self._cached_state["pos_error_integral"] = self.pos_error_integral.clone()
+            self._cached_state["rot_error_integral"] = self.rot_error_integral.clone()
+
+    def restore_training_state(self):
+        """Restore training state after evaluation."""
+        c = self._cached_state
+        self.motion_ids[:] = c["motion_ids"]
+        self.progress_buf[:] = c["progress_buf"]
+        self.running_progress_buf[:] = c["running_progress_buf"]
+        self.reset_buf[:] = c["reset_buf"]
+        self.success_buf[:] = c["success_buf"]
+        self.failure_buf[:] = c["failure_buf"]
+        self.error_buf[:] = c["error_buf"]
+        self.total_rew_buf[:] = c["total_rew_buf"]
+        self.random_state_init = c["random_state_init"]
+        # Physics state
+        self._dof_state[:] = c["_dof_state"]
+        self._root_state[:] = c["_root_state"]
+        self._pos_control[:] = c["_pos_control"]
+        self.curr_targets[:] = c["curr_targets"]
+        self.prev_targets[:] = c["prev_targets"]
+        self.apply_forces[:] = c["apply_forces"]
+        self.apply_torque[:] = c["apply_torque"]
+        if self.use_pid_control:
+            self.prev_pos_error[:] = c["prev_pos_error"]
+            self.prev_rot_error[:] = c["prev_rot_error"]
+            self.pos_error_integral[:] = c["pos_error_integral"]
+            self.rot_error_integral[:] = c["rot_error_integral"]
+        # Chunk metrics
+        if "chunk_eval_count" in c:
+            self.chunk_eval_count[:] = c["chunk_eval_count"]
+            self.chunk_success_count[:] = c["chunk_success_count"]
+            self.chunk_fail_count[:] = c["chunk_fail_count"]
+            self.chunk_completion_sum[:] = c["chunk_completion_sum"]
+            self.chunk_reward_sum[:] = c["chunk_reward_sum"]
+            self.bin_failed_count[:] = c["bin_failed_count"]
+        # Re-apply physics state to simulator (same API as _reset_default, lines 934-951)
+        self.gym.set_dof_state_tensor(self.sim, gymtorch.unwrap_tensor(self._dof_state))
+        self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self._root_state))
+        self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self._pos_control))
+        del self._cached_state
 
     def create_camera(
         self,
@@ -1199,8 +1870,8 @@ def compute_imitation_reward(
     )
 
     succeeded = (
-        progress_buf + 1 + 3 >= max_length
-    ) & ~failed_execute  # reached the end of the trajectory, +3 for max future 3 steps
+        progress_buf + 1 >= max_length
+    ) & ~failed_execute  # reached the end of the chunk (obs lookahead is safe due to clamp at line 912)
     reset_buf = torch.where(
         succeeded | failed_execute,
         torch.ones_like(reset_buf),

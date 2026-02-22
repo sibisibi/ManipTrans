@@ -79,6 +79,8 @@ params:
     score_to_win: 10000
     max_epochs: ${resolve_default:10000,${....max_iterations}}
     early_stop_epochs: ${resolve_default:500,${....early_stop_epochs}}
+    eval_every: ${resolve_default:200,${....eval_every}}
+    chunk_metrics_log_every: ${resolve_default:1,${....chunk_metrics_log_every}}
     save_best_after: 10
     save_frequency: 1000
     print_stats: True
@@ -87,7 +89,7 @@ params:
     truncate_grads: True
     e_clip: 0.2
     horizon_length: 32
-    minibatch_size: 1024
+    minibatch_size: ${resolve_default:1024,${....minibatch_size}}
     mini_epochs: 5
     critic_coef: 4
     clip_value: True
