@@ -518,8 +518,12 @@ class MyA2CBase(BaseAlgorithm):
             dist.broadcast(lr_tensor, 0)
             lr = lr_tensor.item()
 
-        for param_group in self.optimizer.param_groups:
-            param_group["lr"] = lr
+        if getattr(self, '_has_separate_critic_lr', False):
+            # Only update actor param group (index 0); critic LR stays fixed
+            self.optimizer.param_groups[0]["lr"] = lr
+        else:
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = lr
 
         # if self.has_central_value:
         #    self.central_value_net.update_lr(lr)
@@ -792,6 +796,13 @@ class MyA2CBase(BaseAlgorithm):
             # Two-level sampling state
             if hasattr(env, 'bin_failed_count'):
                 cur_state['bin_failed_count'] = env.bin_failed_count.cpu()
+            if hasattr(env, 'bin_completion_ema'):
+                cur_state['bin_completion_ema'] = env.bin_completion_ema.cpu()
+            # Global counters
+            if hasattr(env, 'chunk_eval_count_global'):
+                cur_state['chunk_eval_count_global'] = env.chunk_eval_count_global.cpu()
+                cur_state['chunk_success_count_global'] = env.chunk_success_count_global.cpu()
+                cur_state['chunk_completion_sum_global'] = env.chunk_completion_sum_global.cpu()
             state['curriculum'] = cur_state
 
         return state
@@ -830,6 +841,15 @@ class MyA2CBase(BaseAlgorithm):
                     if 'bin_failed_count' in cur and hasattr(env, 'bin_failed_count') \
                             and cur['bin_failed_count'].shape[0] == env.num_chunks:
                         env.bin_failed_count.copy_(cur['bin_failed_count'].to(env.device))
+                    if 'bin_completion_ema' in cur and hasattr(env, 'bin_completion_ema') \
+                            and cur['bin_completion_ema'].shape[0] == env.num_chunks:
+                        env.bin_completion_ema.copy_(cur['bin_completion_ema'].to(env.device))
+                    # Restore global counters
+                    if 'chunk_eval_count_global' in cur and hasattr(env, 'chunk_eval_count_global') \
+                            and cur['chunk_eval_count_global'].shape[0] == env.num_chunks:
+                        env.chunk_eval_count_global.copy_(cur['chunk_eval_count_global'].to(env.device))
+                        env.chunk_success_count_global.copy_(cur['chunk_success_count_global'].to(env.device))
+                        env.chunk_completion_sum_global.copy_(cur['chunk_completion_sum_global'].to(env.device))
                     print(f"[Curriculum] Restored state for {env.num_chunks} chunks")
                 else:
                     print(f"[Curriculum] Chunk count mismatch: checkpoint has {cur['sampling_weights'].shape[0]}, "
@@ -926,6 +946,10 @@ class MyA2CBase(BaseAlgorithm):
         trajectories (30-60 seconds) rather than isolated 1-second chunks.
         """
         import json
+
+        # --- Defensive: ensure model is in eval mode, restore after ---
+        was_training = self.model.training
+        self.set_eval()
 
         # --- Setup ---
         env.cache_training_state()
@@ -1040,6 +1064,10 @@ class MyA2CBase(BaseAlgorithm):
         # --- Cleanup ---
         env.random_state_init = orig_rsi
         env.restore_training_state()
+
+        # Restore model training state
+        if was_training:
+            self.set_train()
 
         return {"traj_SR": traj_SR, "traj_CR": traj_CR, "traj_E_j": traj_E_j, "traj_E_ft": traj_E_ft}
 
@@ -1617,27 +1645,28 @@ class MyContinuousA2CBase(MyA2CBase):
                     if hasattr(env, 'get_track1_summary'):
                         track1 = env.get_track1_summary()
                         track2 = env.get_track2_summary()
-                        for k, v in {**track1, **track2}.items():
+                        global_stats = env.get_global_summary() if hasattr(env, 'get_global_summary') else {}
+                        per_ds = env.get_per_dataset_summary() if hasattr(env, 'get_per_dataset_summary') else {}
+                        per_sl = env.get_per_seqlen_summary() if hasattr(env, 'get_per_seqlen_summary') else {}
+                        for k, v in {**track1, **track2, **global_stats, **per_ds, **per_sl}.items():
                             self.writer.add_scalar(k, v, frame)
 
-                        # Curriculum: recompute combined two-level sampling weights
+                        # Curriculum: recompute global bin-level sampling weights
                         if self.curriculum_enabled and hasattr(env, '_recompute_sampling_weights'):
                             env._recompute_sampling_weights()
 
                         # Log weight stats
                         if hasattr(env, 'sampling_weights') and env.sampling_weights is not None:
                             w = env.sampling_weights
-                            self.writer.add_scalar("curriculum/weight_mean", w.mean().item(), frame)
-                            self.writer.add_scalar("curriculum/weight_std", w.std().item(), frame)
-                            self.writer.add_scalar("curriculum/weight_max", w.max().item(), frame)
-                            self.writer.add_scalar("curriculum/weight_min", w.min().item(), frame)
-                        # Log trajectory blend weight stats
-                        if hasattr(env, '_traj_blend_weights'):
-                            tw = env._traj_blend_weights
-                            self.writer.add_scalar("curriculum/traj_weight_mean", tw.mean().item(), frame)
-                            self.writer.add_scalar("curriculum/traj_weight_std", tw.std().item(), frame)
-                            self.writer.add_scalar("curriculum/traj_weight_max", tw.max().item(), frame)
-                            self.writer.add_scalar("curriculum/traj_weight_min", tw.min().item(), frame)
+                            # Only log stats over training chunks (non-zero weights)
+                            w_train = w[w > 1e-7]
+                            if len(w_train) > 0:
+                                self.writer.add_scalar("curriculum/weight_mean", w_train.mean().item(), frame)
+                                self.writer.add_scalar("curriculum/weight_std", w_train.std().item(), frame)
+                                self.writer.add_scalar("curriculum/weight_max", w_train.max().item(), frame)
+                                self.writer.add_scalar("curriculum/weight_min", w_train.min().item(), frame)
+                                self.writer.add_scalar("curriculum/weight_max_over_mean",
+                                                       (w_train.max() / w_train.mean()).item(), frame)
 
                 # Periodic evaluation: trajectory-level on test set
                 if epoch_num > 0 and epoch_num % self.eval_every == 0:

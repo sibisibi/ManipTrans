@@ -37,12 +37,15 @@ index_path: ''
 tighten_steps: ''
 tighten_factor: ''
 
-# Two-level sampling
+# Adaptive sampling
+sampling_method: ''
 traj_blend_alpha: ''
 bin_ema_alpha: ''
 sonic_blend_alpha: ''
 sonic_cap_beta: ''
 bin_conv_lambda: ''
+mastery_floor: ''
+twolevel_chunk_alpha: ''
 
 # Evaluation
 eval_every: ''

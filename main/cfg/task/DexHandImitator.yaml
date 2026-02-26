@@ -16,6 +16,7 @@ env:
 
   rolloutStateInit: ${resolve_default:False,${...rolloutStateInit}}
   randomStateInit: ${resolve_default:True,${...randomStateInit}}
+  noisyResetInit: ${resolve_default:True,${...noisyResetInit}}
 
   dataIndices: ${resolve_default:[],${...dataIndices}}
   dataDir: ${resolve_default:'',${...data_dir}}
@@ -40,12 +41,15 @@ env:
   tightenFactor: ${resolve_default:0.7,${...tighten_factor}} # 1.0 means no tightening restriction
   tightenSteps: ${resolve_default:128000,${...tighten_steps}}
 
-  # Two-level hierarchical sampling
+  # Adaptive sampling
+  samplingMethod: ${resolve_default:sonic,${...sampling_method}}  # "sonic" or "mastery"
   trajBlendAlpha: ${resolve_default:0.1,${...traj_blend_alpha}}
   binEmaAlpha: ${resolve_default:0.05,${...bin_ema_alpha}}
   sonicBlendAlpha: ${resolve_default:0.1,${...sonic_blend_alpha}}
   sonicCapBeta: ${resolve_default:200.0,${...sonic_cap_beta}}
   binConvLambda: ${resolve_default:0.8,${...bin_conv_lambda}}
+  masteryFloor: ${resolve_default:0.05,${...mastery_floor}}
+  twoLevelChunkAlpha: ${resolve_default:0.5,${...twolevel_chunk_alpha}}
 
   actionScale: 1.0
   useQuatRot: false

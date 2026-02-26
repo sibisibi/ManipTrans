@@ -192,3 +192,10 @@ runs/*
 
 custom_install.md
 .claude/
+
+body_utils/
+grab_demo/
+mano_v1_2/
+obj_urdf_example.urdf
+smplx_extra/
+teaser.png

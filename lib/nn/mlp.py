@@ -44,7 +44,7 @@ def get_initializer(method: str | Callable, activation: str) -> Callable:
 def build_mlp(
     input_dim,
     *,
-    hidden_dim: int,
+    hidden_dim,
     output_dim: int,
     hidden_depth: int = None,
     num_layers: int = None,
@@ -62,6 +62,9 @@ def build_mlp(
     initialization, which may perform better than ReLU.
 
     Args:
+        hidden_dim: int for uniform width, or list[int] for per-layer widths.
+            When a list is provided, hidden_depth/num_layers are inferred from
+            the list length and should not be specified.
         norm_type: None, "batchnorm", "layernorm", applied to intermediate layers
         add_input_activation: whether to add a nonlinearity to the input _before_
             the MLP computation. This is useful for processing a feature from a preceding
@@ -81,14 +84,22 @@ def build_mlp(
             _after_ the MLP computation.
             values: True to add the `norm_type` to the input
     """
-    assert (hidden_depth is None) != (num_layers is None), (
-        "Either hidden_depth or num_layers must be specified, but not both. "
-        "num_layers is defined as hidden_depth+1"
-    )
-    if hidden_depth is not None:
-        assert hidden_depth >= 0
-    if num_layers is not None:
-        assert num_layers >= 1
+    # Support list[int] hidden_dim: per-layer widths (also handles omegaconf.ListConfig)
+    if not isinstance(hidden_dim, (int, float)):
+        hidden_dims = [int(x) for x in hidden_dim]
+        hidden_depth = len(hidden_dims)
+    else:
+        assert (hidden_depth is None) != (num_layers is None), (
+            "Either hidden_depth or num_layers must be specified, but not both. "
+            "num_layers is defined as hidden_depth+1"
+        )
+        if hidden_depth is not None:
+            assert hidden_depth >= 0
+        if num_layers is not None:
+            assert num_layers >= 1
+        hidden_depth = num_layers - 1 if hidden_depth is None else hidden_depth
+        hidden_dims = [hidden_dim] * hidden_depth
+
     act_layer = get_activation(activation)
 
     weight_init = get_initializer(weight_init, activation)
@@ -106,18 +117,17 @@ def build_mlp(
     else:
         raise ValueError(f"Unsupported norm layer: {norm_type}")
 
-    hidden_depth = num_layers - 1 if hidden_depth is None else hidden_depth
     if hidden_depth == 0:
         mods = [nn.Linear(input_dim, output_dim)]
     else:
-        mods = [nn.Linear(input_dim, hidden_dim), norm_type(hidden_dim), act_layer()]
-        for i in range(hidden_depth - 1):
+        mods = [nn.Linear(input_dim, hidden_dims[0]), norm_type(hidden_dims[0]), act_layer()]
+        for i in range(1, hidden_depth):
             mods += [
-                nn.Linear(hidden_dim, hidden_dim),
-                norm_type(hidden_dim),
+                nn.Linear(hidden_dims[i - 1], hidden_dims[i]),
+                norm_type(hidden_dims[i]),
                 act_layer(),
             ]
-        mods.append(nn.Linear(hidden_dim, output_dim))
+        mods.append(nn.Linear(hidden_dims[-1], output_dim))
 
     if add_input_norm:
         mods = [norm_type(input_dim)] + mods
@@ -145,7 +155,7 @@ class MLP(nn.Module):
         self,
         input_dim,
         *,
-        hidden_dim: int,
+        hidden_dim,
         output_dim: int,
         hidden_depth: int = None,
         num_layers: int = None,

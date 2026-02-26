@@ -44,12 +44,30 @@ class PPOAgent(MyContinuousA2CBase):
         self.init_rnn_from_model(self.model)
         self.last_lr = float(self.last_lr)
         self.bound_loss_type = self.config.get("bound_loss_type", "bound")  # 'regularisation' or 'bound'
-        self.optimizer = optim.Adam(
-            self.model.parameters(),
-            float(self.last_lr),
-            eps=1e-08,
-            weight_decay=self.weight_decay,
-        )
+        self.critic_lr = float(self.config.get("critic_lr", 0))
+        if self.critic_lr > 0 and hasattr(self.model, 'critic_mlp'):
+            # Separate actor/critic learning rates (SONIC-style)
+            critic_param_ids = set(id(p) for p in self.model.critic_mlp.parameters())
+            critic_param_ids.update(id(p) for p in self.model.value.parameters())
+            actor_params = [p for p in self.model.parameters() if id(p) not in critic_param_ids]
+            critic_params = [p for p in self.model.parameters() if id(p) in critic_param_ids]
+            self.optimizer = optim.Adam(
+                [
+                    {"params": actor_params, "lr": float(self.last_lr)},
+                    {"params": critic_params, "lr": self.critic_lr},
+                ],
+                eps=1e-08,
+                weight_decay=self.weight_decay,
+            )
+            self._has_separate_critic_lr = True
+        else:
+            self.optimizer = optim.Adam(
+                self.model.parameters(),
+                float(self.last_lr),
+                eps=1e-08,
+                weight_decay=self.weight_decay,
+            )
+            self._has_separate_critic_lr = False
 
         if self.has_central_value:
             cv_config = {
