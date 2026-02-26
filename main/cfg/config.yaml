@@ -19,6 +19,7 @@ lh_base_model_checkpoint: assets/imitator_lh_inspire.pth
 num_envs: ''
 rolloutStateInit: False
 randomStateInit: True
+noisyResetInit: True
 
 rolloutLen: null
 rolloutBegin: null
