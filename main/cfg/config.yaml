@@ -20,6 +20,9 @@ num_envs: ''
 rolloutStateInit: False
 randomStateInit: True
 noisyResetInit: True
+wrist_power_weight: 0.5
+wrist_pos_weight: 0.1
+wrist_ang_vel_weight: 0.05
 
 rolloutLen: null
 rolloutBegin: null

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import random
+import yaml
 from enum import Enum
 from itertools import cycle
 from time import time
@@ -104,6 +105,9 @@ class DexHandImitatorRHEnv(VecTask):
         self.rollout_state_init = self.cfg["env"]["rolloutStateInit"]
         self.random_state_init = self.cfg["env"]["randomStateInit"]
         self.noisy_reset_init = self.cfg["env"].get("noisyResetInit", True)
+        self.wrist_power_weight = float(self.cfg["env"].get("wristPowerWeight", 0.5))
+        self.wrist_pos_weight = float(self.cfg["env"].get("wristPosWeight", 0.1))
+        self.wrist_ang_vel_weight = float(self.cfg["env"].get("wristAngVelWeight", 0.05))
 
         self.tighten_method = self.cfg["env"]["tightenMethod"]
         self.tighten_factor = self.cfg["env"]["tightenFactor"]
@@ -468,6 +472,53 @@ class DexHandImitatorRHEnv(VecTask):
             self.chunk_success_count_global = torch.zeros(self.num_chunks, device=self.device)
             self.chunk_completion_sum_global = torch.zeros(self.num_chunks, device=self.device)
 
+        # Per-joint-group error histograms for adaptive threshold statistics
+        self._err_joint_groups = [
+            "thumb_tip", "index_tip", "middle_tip", "ring_tip", "pinky_tip",
+            "level_1", "level_2",
+            "wrist_pos", "wrist_rot", "wrist_vel", "wrist_ang_vel", "joints_vel",
+        ]
+        self._err_hist_nbins = 200
+        # Different histogram ranges for different error types (all in native units)
+        self._err_hist_range = {
+            "thumb_tip": 0.2, "index_tip": 0.2, "middle_tip": 0.2,  # meters
+            "ring_tip": 0.2, "pinky_tip": 0.2,
+            "level_1": 0.2, "level_2": 0.2,
+            "wrist_pos": 0.2,           # meters
+            "wrist_rot": 3.15,          # radians (~pi)
+            "wrist_vel": 10.0,          # m/s
+            "wrist_ang_vel": 20.0,      # rad/s
+            "joints_vel": 10.0,         # rad/s (mean across joints)
+        }
+        self._err_histograms = {
+            g: torch.zeros(self._err_hist_nbins, device=self.device)
+            for g in self._err_joint_groups
+        }
+        self._err_hist_count = 0
+
+        # Chunk-level max error tracking: running max per env, recorded on episode end
+        n_groups = len(self._err_joint_groups)
+        self._err_chunk_max = torch.zeros(self.num_envs, n_groups, device=self.device)
+        self._err_chunk_max_active = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._err_chunk_max_histograms = {
+            g: torch.zeros(self._err_hist_nbins, device=self.device)
+            for g in self._err_joint_groups
+        }
+        self._err_chunk_max_count = 0
+
+        # Adaptive termination thresholds
+        self._adaptive_alpha = float(self.cfg["env"].get("adaptiveAlpha", 0.0))
+        # The 7 termination groups in JIT column order (must match failed_execute indexing)
+        self._termination_groups = [
+            "thumb_tip", "index_tip", "middle_tip", "pinky_tip", "ring_tip",
+            "level_1", "level_2",
+        ]
+        self._base_thresholds = torch.tensor(
+            [0.04, 0.045, 0.05, 0.06, 0.06, 0.07, 0.08], device=self.device
+        )
+        self._default_thresholds = self._base_thresholds / 0.7  # loosest initial thresholds
+
+        if self.sampling_weights is not None:
             # Build chunk-to-sequence mapping from CSV data
             seq_key_to_id = {}
             chunk_to_seq_list = []
@@ -503,6 +554,54 @@ class DexHandImitatorRHEnv(VecTask):
             self.chunk_to_dataset = torch.tensor(chunk_to_dataset_list, dtype=torch.long, device=self.device)
             self.dataset_names = list(dataset_name_to_id.keys())
             self.num_datasets = len(self.dataset_names)
+
+            # Per-dataset sampling weight multiplier
+            ds_weights_path = self.cfg["env"].get("datasetWeightsPath", "")
+            if ds_weights_path and os.path.isfile(ds_weights_path):
+                with open(ds_weights_path, "r") as f:
+                    ds_weights_cfg = yaml.safe_load(f)
+                multiplier = torch.ones(self.num_chunks, device=self.device)
+                for ci in range(self.num_chunks):
+                    ds_name = self.dataset_names[chunk_to_dataset_list[ci]]
+                    # Try exact match first, then prefix match (longest prefix wins)
+                    w = ds_weights_cfg.get(ds_name, None)
+                    if w is None:
+                        best_prefix = ""
+                        for key in ds_weights_cfg:
+                            if ds_name.startswith(key) and len(key) > len(best_prefix):
+                                best_prefix = key
+                        w = ds_weights_cfg[best_prefix] if best_prefix else 1.0
+                    multiplier[ci] = float(w)
+                # Normalize so sum(multiplier) = num_chunks
+                multiplier *= self.num_chunks / multiplier.sum()
+                self._dataset_weight_multiplier = multiplier
+                print("[DexHandImitator] Loaded dataset weights from %s" % ds_weights_path)
+                for ds_name in self.dataset_names:
+                    ds_mask = self.chunk_to_dataset == dataset_name_to_id[ds_name]
+                    mean_w = multiplier[ds_mask].mean().item() if ds_mask.any() else 0.0
+                    print("  %s: mean_multiplier=%.3f" % (ds_name, mean_w))
+            else:
+                self._dataset_weight_multiplier = torch.ones(self.num_chunks, device=self.device)
+
+            # Per-dataset frame-level error histograms
+            self._err_histograms_by_dataset = {
+                g: torch.zeros(self.num_datasets, self._err_hist_nbins, device=self.device)
+                for g in self._err_joint_groups
+            }
+            self._err_hist_count_by_dataset = torch.zeros(self.num_datasets, dtype=torch.long, device=self.device)
+
+            # Per-dataset chunk-max error histograms
+            self._err_chunk_max_histograms_by_dataset = {
+                g: torch.zeros(self.num_datasets, self._err_hist_nbins, device=self.device)
+                for g in self._err_joint_groups
+            }
+            self._err_chunk_max_count_by_dataset = torch.zeros(self.num_datasets, dtype=torch.long, device=self.device)
+
+            # Per-dataset adaptive thresholds (only active when adaptive_alpha > 0)
+            if self._adaptive_alpha > 0:
+                self._adaptive_thresholds = self._default_thresholds.unsqueeze(0).expand(
+                    self.num_datasets, -1
+                ).clone()  # shape (num_datasets, 7)
 
             # === Two-level sampling state ===
 
@@ -861,26 +960,35 @@ class DexHandImitatorRHEnv(VecTask):
         )  # ? torque * angular velocity
         target_state["wrist_power"] = wrist_power
 
-        if self.training:
-            last_step = self.gym.get_frame_count(self.sim)
-            if self.tighten_method == "None":
-                scale_factor = 1.0
-            elif self.tighten_method == "const":
-                scale_factor = self.tighten_factor
-            elif self.tighten_method == "linear_decay":
-                scale_factor = 1 - (1 - self.tighten_factor) / self.tighten_steps * min(last_step, self.tighten_steps)
-            elif self.tighten_method == "exp_decay":
-                scale_factor = (np.e * 2) ** (-1 * last_step / self.tighten_steps) * (
-                    1 - self.tighten_factor
-                ) + self.tighten_factor
-            elif self.tighten_method == "cos":
-                scale_factor = (self.tighten_factor) + np.abs(
-                    -1 * (1 - self.tighten_factor) * np.cos(last_step / self.tighten_steps * np.pi)
-                ) * (2 ** (-1 * last_step / self.tighten_steps))
+        # Build per-env termination thresholds tensor (num_envs, 7)
+        if self._adaptive_alpha > 0 and self.training and hasattr(self, '_adaptive_thresholds'):
+            # Adaptive path: per-dataset per-group thresholds
+            env_ds = self.chunk_to_dataset[self.motion_ids]  # (num_envs,)
+            term_thresholds = self._adaptive_thresholds[env_ds]  # (num_envs, 7)
+        else:
+            # Legacy path: compute scale_factor exactly as before
+            if self.training:
+                last_step = self.gym.get_frame_count(self.sim)
+                if self.tighten_method == "None":
+                    scale_factor = 1.0
+                elif self.tighten_method == "const":
+                    scale_factor = self.tighten_factor
+                elif self.tighten_method == "linear_decay":
+                    scale_factor = 1 - (1 - self.tighten_factor) / self.tighten_steps * min(last_step, self.tighten_steps)
+                elif self.tighten_method == "exp_decay":
+                    scale_factor = (np.e * 2) ** (-1 * last_step / self.tighten_steps) * (
+                        1 - self.tighten_factor
+                    ) + self.tighten_factor
+                elif self.tighten_method == "cos":
+                    scale_factor = (self.tighten_factor) + np.abs(
+                        -1 * (1 - self.tighten_factor) * np.cos(last_step / self.tighten_steps * np.pi)
+                    ) * (2 ** (-1 * last_step / self.tighten_steps))
+                else:
+                    scale_factor = 1.0
             else:
                 scale_factor = 1.0
-        else:
-            scale_factor = 1.0
+            # Build (num_envs, 7) from scalar scale_factor — numerically identical to old hardcoded values
+            term_thresholds = (self._base_thresholds / 0.7 * scale_factor).unsqueeze(0).expand(self.num_envs, -1)
 
         assert not self.headless or isinstance(compute_imitation_reward, torch.jit.ScriptFunction)
 
@@ -893,11 +1001,46 @@ class DexHandImitatorRHEnv(VecTask):
                 self.states,
                 target_state,
                 max_length,
-                scale_factor,
+                term_thresholds,
                 self.dexhand.weight_idx,
+                self.wrist_power_weight,
+                self.wrist_pos_weight,
+                self.wrist_ang_vel_weight,
             )
         )
         self.total_rew_buf += self.rew_buf
+
+        # Accumulate per-joint-group error histograms (exclude grace period)
+        active = self.running_progress_buf >= 20
+        if active.any():
+            active_idx = active.nonzero(as_tuple=True)[0]
+            for gi, g in enumerate(self._err_joint_groups):
+                errs = self.reward_dict["err_" + g][active]
+                hmax = self._err_hist_range[g]
+                # Global frame-level histogram
+                hist = torch.histc(errs, bins=self._err_hist_nbins, min=0, max=hmax)
+                self._err_histograms[g] += hist
+                # Update per-env chunk running max
+                self._err_chunk_max[active_idx, gi] = torch.max(
+                    self._err_chunk_max[active_idx, gi], errs
+                )
+            self._err_chunk_max_active[active_idx] = True
+            self._err_hist_count += int(active.sum().item())
+
+            # Per-dataset frame-level histograms
+            if hasattr(self, '_err_histograms_by_dataset'):
+                env_ds = self.chunk_to_dataset[self.motion_ids[active_idx]]
+                for ds_id in range(self.num_datasets):
+                    ds_mask = env_ds == ds_id
+                    if not ds_mask.any():
+                        continue
+                    n_ds = int(ds_mask.sum().item())
+                    self._err_hist_count_by_dataset[ds_id] += n_ds
+                    for gi, g in enumerate(self._err_joint_groups):
+                        errs_ds = self.reward_dict["err_" + g][active][ds_mask]
+                        hmax = self._err_hist_range[g]
+                        hist_ds = torch.histc(errs_ds, bins=self._err_hist_nbins, min=0, max=hmax)
+                        self._err_histograms_by_dataset[g][ds_id] += hist_ds
 
     def compute_eval_metrics(self):
         """Compute raw tracking errors for evaluation. NOT for reward — raw L2 errors."""
@@ -938,15 +1081,14 @@ class DexHandImitatorRHEnv(VecTask):
         E_j = diff_joints_pos_dist.mean(dim=-1)  # [num_envs]
         E_ft = torch.stack([thumb_err, index_err, middle_err, ring_err, pinky_err], dim=-1).mean(dim=-1)  # [num_envs]
 
-        # FIXED termination thresholds (tightened end-state: base_value / 0.7 * 0.7 = base_value)
-        # These match compute_imitation_reward lines 1381-1389 at scale_factor = 0.7
+        # Fixed eval thresholds: 60mm fingertips, 80mm joints
         failed = (
-            (thumb_err > 0.04)
-            | (index_err > 0.045)
-            | (middle_err > 0.05)
+            (thumb_err > 0.06)
+            | (index_err > 0.06)
+            | (middle_err > 0.06)
             | (ring_err > 0.06)
             | (pinky_err > 0.06)
-            | (level_1_err > 0.07)
+            | (level_1_err > 0.08)
             | (level_2_err > 0.08)
         )
 
@@ -1189,6 +1331,9 @@ class DexHandImitatorRHEnv(VecTask):
             self.prev_rot_error[env_ids] = 0
             self.pos_error_integral[env_ids] = 0
             self.rot_error_integral[env_ids] = 0
+        # Reset chunk-max error tracking for new episodes
+        self._err_chunk_max[env_ids] = 0
+        self._err_chunk_max_active[env_ids] = False
 
     def reset_idx(self, env_ids):
         self._refresh()
@@ -1335,6 +1480,7 @@ class DexHandImitatorRHEnv(VecTask):
             done_env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
             self.update_chunk_metrics(done_env_ids)
             self.update_bin_failures(done_env_ids)
+            self._record_chunk_max_errors(done_env_ids)
 
             # Cross-chunk continuation: advance non-last chunks instead of resetting.
             # Must be AFTER metrics (so chunk completion is recorded) and
@@ -1646,6 +1792,10 @@ class DexHandImitatorRHEnv(VecTask):
         # The policy must maintain tracking quality across transitions.
         # (running_progress_buf is only reset on full episode reset in _reset_default)
 
+        # Reset chunk-max tracking for the new chunk (old chunk max already recorded)
+        self._err_chunk_max[continue_ids] = 0
+        self._err_chunk_max_active[continue_ids] = False
+
     def _convolve_within_seq(self, values):
         """Spread failure blame to preceding chunks within same trajectory.
         BeyondMimic: chunk i's failure is partially attributed to chunks i-1, i-2.
@@ -1723,6 +1873,7 @@ class DexHandImitatorRHEnv(VecTask):
             self.sonic_blend_alpha * adaptive_norm
             + (1 - self.sonic_blend_alpha) * uniform
         )
+        self.sampling_weights *= self._dataset_weight_multiplier
 
         # Numerical safety
         self.sampling_weights.clamp_(min=1e-8)
@@ -1767,6 +1918,7 @@ class DexHandImitatorRHEnv(VecTask):
 
         alpha = self.sonic_blend_alpha
         self.sampling_weights[:] = alpha * adaptive_norm + (1 - alpha) * uniform
+        self.sampling_weights *= self._dataset_weight_multiplier
 
         # Numerical safety
         self.sampling_weights.clamp_(min=1e-8)
@@ -1847,6 +1999,7 @@ class DexHandImitatorRHEnv(VecTask):
         # --- Final: P(traj) * P(chunk | traj) ---
         traj_weight_per_chunk = traj_weight[self.chunk_to_seq]
         self.sampling_weights[:] = traj_weight_per_chunk * chunk_within_weight
+        self.sampling_weights *= self._dataset_weight_multiplier
 
         # Numerical safety
         self.sampling_weights.clamp_(min=1e-8)
@@ -1862,6 +2015,181 @@ class DexHandImitatorRHEnv(VecTask):
         self.chunk_eval_count.zero_()
         self.chunk_completion_sum.zero_()
         self.chunk_reward_sum.zero_()
+
+    def _record_chunk_max_errors(self, done_env_ids):
+        """Record per-chunk max errors into histograms when episodes end."""
+        if len(done_env_ids) == 0:
+            return
+        # Only record envs that had at least one active frame (past grace period)
+        valid = self._err_chunk_max_active[done_env_ids]
+        if not valid.any():
+            return
+        valid_ids = done_env_ids[valid]
+
+        # Global chunk-max histograms
+        for gi, g in enumerate(self._err_joint_groups):
+            maxvals = self._err_chunk_max[valid_ids, gi]
+            hmax = self._err_hist_range[g]
+            hist = torch.histc(maxvals, bins=self._err_hist_nbins, min=0, max=hmax)
+            self._err_chunk_max_histograms[g] += hist
+        self._err_chunk_max_count += len(valid_ids)
+
+        # Per-dataset chunk-max histograms
+        if hasattr(self, '_err_chunk_max_histograms_by_dataset'):
+            env_ds = self.chunk_to_dataset[self.motion_ids[valid_ids]]
+            for ds_id in range(self.num_datasets):
+                ds_mask = env_ds == ds_id
+                if not ds_mask.any():
+                    continue
+                ds_ids = valid_ids[ds_mask]
+                self._err_chunk_max_count_by_dataset[ds_id] += len(ds_ids)
+                for gi, g in enumerate(self._err_joint_groups):
+                    maxvals = self._err_chunk_max[ds_ids, gi]
+                    hmax = self._err_hist_range[g]
+                    hist = torch.histc(maxvals, bins=self._err_hist_nbins, min=0, max=hmax)
+                    self._err_chunk_max_histograms_by_dataset[g][ds_id] += hist
+
+    def _percentiles_from_hist(self, hist, hmax, to_mm=False):
+        """Compute percentiles from a single histogram. Returns dict {pct: value}."""
+        total = hist.sum()
+        if total < 1:
+            return {}
+        bin_width = hmax / self._err_hist_nbins
+        bin_centers = torch.arange(self._err_hist_nbins, device=self.device) * bin_width + bin_width / 2
+        cdf = hist.cumsum(0) / total
+        result = {}
+        for pct in [50, 75, 90, 95, 99]:
+            idx = (cdf >= pct / 100.0).nonzero(as_tuple=True)[0]
+            val = bin_centers[idx[0]].item() if len(idx) > 0 else hmax
+            if to_mm:
+                val = val * 1000
+            result[pct] = val
+        return result
+
+    def get_error_percentiles(self):
+        """Compute per-joint-group error percentiles from all histogram types."""
+        result = {}
+        pos_groups = {"thumb_tip", "index_tip", "middle_tip", "ring_tip", "pinky_tip",
+                      "level_1", "level_2", "wrist_pos"}
+
+        # === Global frame-level percentiles ===
+        if self._err_hist_count > 0:
+            for g in self._err_joint_groups:
+                hmax = self._err_hist_range[g]
+                pcts = self._percentiles_from_hist(
+                    self._err_histograms[g], hmax, to_mm=(g in pos_groups))
+                for pct, val in pcts.items():
+                    result["err_pct/%s/p%d" % (g, pct)] = val
+            result["err_pct/sample_count"] = self._err_hist_count
+
+        # === Global chunk-max percentiles ===
+        if self._err_chunk_max_count > 0:
+            for g in self._err_joint_groups:
+                hmax = self._err_hist_range[g]
+                pcts = self._percentiles_from_hist(
+                    self._err_chunk_max_histograms[g], hmax, to_mm=(g in pos_groups))
+                for pct, val in pcts.items():
+                    result["err_chunk_max/%s/p%d" % (g, pct)] = val
+            result["err_chunk_max/chunk_count"] = self._err_chunk_max_count
+
+        # === Per-dataset frame-level percentiles ===
+        if hasattr(self, '_err_histograms_by_dataset'):
+            for ds_id, ds_name in enumerate(self.dataset_names):
+                cnt = self._err_hist_count_by_dataset[ds_id].item()
+                if cnt == 0:
+                    continue
+                for g in self._err_joint_groups:
+                    hmax = self._err_hist_range[g]
+                    pcts = self._percentiles_from_hist(
+                        self._err_histograms_by_dataset[g][ds_id], hmax, to_mm=(g in pos_groups))
+                    for pct, val in pcts.items():
+                        result["err_pct_ds/%s/%s/p%d" % (ds_name, g, pct)] = val
+
+        # === Per-dataset chunk-max percentiles ===
+        if hasattr(self, '_err_chunk_max_histograms_by_dataset'):
+            for ds_id, ds_name in enumerate(self.dataset_names):
+                cnt = self._err_chunk_max_count_by_dataset[ds_id].item()
+                if cnt == 0:
+                    continue
+                for g in self._err_joint_groups:
+                    hmax = self._err_hist_range[g]
+                    pcts = self._percentiles_from_hist(
+                        self._err_chunk_max_histograms_by_dataset[g][ds_id], hmax, to_mm=(g in pos_groups))
+                    for pct, val in pcts.items():
+                        result["err_chunk_max_ds/%s/%s/p%d" % (ds_name, g, pct)] = val
+
+        # === Per-dataset effective sampling fractions ===
+        if hasattr(self, 'sampling_weights') and self.sampling_weights is not None:
+            w = self.sampling_weights
+            w_sum = w.sum()
+            if w_sum > 0:
+                for ds_id, ds_name in enumerate(self.dataset_names):
+                    ds_mask = self.chunk_to_dataset == ds_id
+                    frac = w[ds_mask].sum().item() / w_sum.item()
+                    result["sampling_frac/%s" % ds_name] = frac
+
+        return result
+
+    def _percentile_from_hist_raw(self, hist, hmax, pct):
+        """Compute a single percentile from a histogram. Returns value in native units (meters)."""
+        total = hist.sum()
+        if total < 1:
+            return None
+        bin_width = hmax / self._err_hist_nbins
+        bin_centers = torch.arange(self._err_hist_nbins, device=self.device) * bin_width + bin_width / 2
+        cdf = hist.cumsum(0) / total
+        idx = (cdf >= pct / 100.0).nonzero(as_tuple=True)[0]
+        return bin_centers[idx[0]].item() if len(idx) > 0 else hmax
+
+    def update_adaptive_thresholds(self):
+        """Update per-dataset per-group adaptive thresholds from chunk-max histograms.
+        Only does work when adaptive_alpha > 0. Returns dict for TB logging."""
+        result = {}
+        if self._adaptive_alpha <= 0 or not hasattr(self, '_adaptive_thresholds'):
+            return result
+
+        pct = self._adaptive_alpha * 100  # e.g. 0.9 -> p90
+        min_chunks = 50
+
+        for gi, g in enumerate(self._termination_groups):
+            hmax = self._err_hist_range[g]
+            # Global fallback: p(alpha) from global chunk-max histogram
+            global_val = None
+            if self._err_chunk_max_count >= min_chunks:
+                global_val = self._percentile_from_hist_raw(
+                    self._err_chunk_max_histograms[g], hmax, pct)
+
+            for ds_id in range(self.num_datasets):
+                ds_name = self.dataset_names[ds_id]
+                cnt = self._err_chunk_max_count_by_dataset[ds_id].item()
+                if cnt >= min_chunks:
+                    val = self._percentile_from_hist_raw(
+                        self._err_chunk_max_histograms_by_dataset[g][ds_id], hmax, pct)
+                elif global_val is not None:
+                    val = global_val
+                else:
+                    val = None  # keep default
+
+                if val is not None:
+                    val = max(val, self._base_thresholds[gi].item())
+                    self._adaptive_thresholds[ds_id, gi] = val
+                    result["adaptive_th/%s/%s" % (ds_name, g)] = val * 1000  # log in mm
+
+        return result
+
+    def reset_error_histograms(self):
+        """Reset all error histograms (call after logging)."""
+        for g in self._err_joint_groups:
+            self._err_histograms[g].zero_()
+            self._err_chunk_max_histograms[g].zero_()
+        self._err_hist_count = 0
+        self._err_chunk_max_count = 0
+        if hasattr(self, '_err_histograms_by_dataset'):
+            for g in self._err_joint_groups:
+                self._err_histograms_by_dataset[g].zero_()
+                self._err_chunk_max_histograms_by_dataset[g].zero_()
+            self._err_hist_count_by_dataset.zero_()
+            self._err_chunk_max_count_by_dataset.zero_()
 
     def get_split_indices(self, split_name):
         """Return chunk indices for the given split."""
@@ -1933,6 +2261,18 @@ class DexHandImitatorRHEnv(VecTask):
                 self._cached_state["chunk_eval_count_global"] = self.chunk_eval_count_global.clone()
                 self._cached_state["chunk_success_count_global"] = self.chunk_success_count_global.clone()
                 self._cached_state["chunk_completion_sum_global"] = self.chunk_completion_sum_global.clone()
+        # Error histograms (prevent eval from polluting adaptive thresholds)
+        self._cached_state["_err_hist_count"] = self._err_hist_count
+        self._cached_state["_err_chunk_max_count"] = self._err_chunk_max_count
+        self._cached_state["_err_histograms"] = {g: h.clone() for g, h in self._err_histograms.items()}
+        self._cached_state["_err_chunk_max_histograms"] = {g: h.clone() for g, h in self._err_chunk_max_histograms.items()}
+        self._cached_state["_err_chunk_max"] = self._err_chunk_max.clone()
+        self._cached_state["_err_chunk_max_active"] = self._err_chunk_max_active.clone()
+        if hasattr(self, '_err_histograms_by_dataset'):
+            self._cached_state["_err_histograms_by_dataset"] = {g: h.clone() for g, h in self._err_histograms_by_dataset.items()}
+            self._cached_state["_err_chunk_max_histograms_by_dataset"] = {g: h.clone() for g, h in self._err_chunk_max_histograms_by_dataset.items()}
+            self._cached_state["_err_hist_count_by_dataset"] = self._err_hist_count_by_dataset.clone()
+            self._cached_state["_err_chunk_max_count_by_dataset"] = self._err_chunk_max_count_by_dataset.clone()
         # PID state if applicable
         if self.use_pid_control:
             self._cached_state["prev_pos_error"] = self.prev_pos_error.clone()
@@ -1979,6 +2319,21 @@ class DexHandImitatorRHEnv(VecTask):
                 self.chunk_eval_count_global[:] = c["chunk_eval_count_global"]
                 self.chunk_success_count_global[:] = c["chunk_success_count_global"]
                 self.chunk_completion_sum_global[:] = c["chunk_completion_sum_global"]
+        # Error histograms
+        if "_err_hist_count" in c:
+            self._err_hist_count = c["_err_hist_count"]
+            self._err_chunk_max_count = c["_err_chunk_max_count"]
+            for g in self._err_histograms:
+                self._err_histograms[g][:] = c["_err_histograms"][g]
+                self._err_chunk_max_histograms[g][:] = c["_err_chunk_max_histograms"][g]
+            self._err_chunk_max[:] = c["_err_chunk_max"]
+            self._err_chunk_max_active[:] = c["_err_chunk_max_active"]
+            if "_err_histograms_by_dataset" in c:
+                for g in self._err_histograms_by_dataset:
+                    self._err_histograms_by_dataset[g][:] = c["_err_histograms_by_dataset"][g]
+                    self._err_chunk_max_histograms_by_dataset[g][:] = c["_err_chunk_max_histograms_by_dataset"][g]
+                self._err_hist_count_by_dataset[:] = c["_err_hist_count_by_dataset"]
+                self._err_chunk_max_count_by_dataset[:] = c["_err_chunk_max_count_by_dataset"]
         # Re-apply physics state to simulator using INDEXED versions (take effect immediately).
         # Non-indexed set_*_tensor is deferred until simulate(), but refresh_*_tensor in
         # compute_observations would overwrite the tensor with stale (eval) state first.
@@ -2082,11 +2437,14 @@ def compute_imitation_reward(
     states: Dict[str, Tensor],
     target_states: Dict[str, Tensor],
     max_length: List[int],
-    scale_factor: float,
+    term_thresholds: Tensor,
     dexhand_weight_idx: Dict[str, List[int]],
+    wrist_power_weight: float,
+    wrist_pos_weight: float,
+    wrist_ang_vel_weight: float,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
 
-    # type: (Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, Tensor], Tensor, float, Dict[str, List[int]]) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor]]
+    # type: (Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, Tensor], Tensor, Tensor, Dict[str, List[int]], float, float, float) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor]]
 
     # end effector pose reward
     current_eef_pos = states["base_state"][:, :3]
@@ -2155,18 +2513,18 @@ def compute_imitation_reward(
 
     failed_execute = (
         (
-            (diff_thumb_tip_pos_dist > 0.04 / 0.7 * scale_factor)
-            | (diff_index_tip_pos_dist > 0.045 / 0.7 * scale_factor)
-            | (diff_middle_tip_pos_dist > 0.05 / 0.7 * scale_factor)
-            | (diff_pinky_tip_pos_dist > 0.06 / 0.7 * scale_factor)
-            | (diff_ring_tip_pos_dist > 0.06 / 0.7 * scale_factor)
-            | (diff_level_1_pos_dist > 0.07 / 0.7 * scale_factor)
-            | (diff_level_2_pos_dist > 0.08 / 0.7 * scale_factor)
+            (diff_thumb_tip_pos_dist > term_thresholds[:, 0])
+            | (diff_index_tip_pos_dist > term_thresholds[:, 1])
+            | (diff_middle_tip_pos_dist > term_thresholds[:, 2])
+            | (diff_pinky_tip_pos_dist > term_thresholds[:, 3])
+            | (diff_ring_tip_pos_dist > term_thresholds[:, 4])
+            | (diff_level_1_pos_dist > term_thresholds[:, 5])
+            | (diff_level_2_pos_dist > term_thresholds[:, 6])
         )
         & (running_progress_buf >= 20)
     ) | error_buf
     reward_execute = (
-        0.1 * reward_eef_pos
+        wrist_pos_weight * reward_eef_pos
         + 0.6 * reward_eef_rot
         + 0.9 * reward_thumb_tip_pos
         + 0.8 * reward_index_tip_pos
@@ -2176,10 +2534,10 @@ def compute_imitation_reward(
         + 0.5 * reward_level_1_pos
         + 0.3 * reward_level_2_pos
         + 0.1 * reward_eef_vel
-        + 0.05 * reward_eef_ang_vel
+        + wrist_ang_vel_weight * reward_eef_ang_vel
         + 0.1 * reward_joints_vel
         + 0.5 * reward_power
-        + 0.5 * reward_wrist_power
+        + wrist_power_weight * reward_wrist_power
     )
 
     succeeded = (
@@ -2207,6 +2565,20 @@ def compute_imitation_reward(
         ),
         "reward_power": reward_power,
         "reward_wrist_power": reward_wrist_power,
+        # Raw per-joint-group L2 errors (meters) for adaptive threshold statistics
+        "err_thumb_tip": diff_thumb_tip_pos_dist,
+        "err_index_tip": diff_index_tip_pos_dist,
+        "err_middle_tip": diff_middle_tip_pos_dist,
+        "err_ring_tip": diff_ring_tip_pos_dist,
+        "err_pinky_tip": diff_pinky_tip_pos_dist,
+        "err_level_1": diff_level_1_pos_dist,
+        "err_level_2": diff_level_2_pos_dist,
+        # Wrist errors (no termination threshold, but useful for statistics)
+        "err_wrist_pos": diff_eef_pos_dist,
+        "err_wrist_rot": diff_eef_rot_angle.abs(),
+        "err_wrist_vel": diff_eef_vel.abs().mean(dim=-1),
+        "err_wrist_ang_vel": diff_eef_ang_vel.abs().mean(dim=-1),
+        "err_joints_vel": diff_joints_vel.abs().mean(dim=-1).mean(-1),
     }
 
     return reward_execute, reset_buf, succeeded, failed_execute, reward_dict

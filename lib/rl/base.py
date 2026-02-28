@@ -1676,6 +1676,18 @@ class MyContinuousA2CBase(MyA2CBase):
 
                 if epoch_num % self.chunk_metrics_log_every == 0:
                     env = self.vec_env.env
+                    # Log per-joint-group error percentiles
+                    if hasattr(env, 'get_error_percentiles'):
+                        err_pct = env.get_error_percentiles()
+                        for k, v in err_pct.items():
+                            self.writer.add_scalar(k, v, epoch_num)
+                    # Update adaptive termination thresholds (before resetting histograms)
+                    if hasattr(env, 'update_adaptive_thresholds'):
+                        adaptive_th = env.update_adaptive_thresholds()
+                        for k, v in adaptive_th.items():
+                            self.writer.add_scalar(k, v, epoch_num)
+                    if hasattr(env, 'get_error_percentiles'):
+                        env.reset_error_histograms()
                     if hasattr(env, 'reset_chunk_metrics'):
                         env.reset_chunk_metrics()
 

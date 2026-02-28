@@ -17,6 +17,9 @@ env:
   rolloutStateInit: ${resolve_default:False,${...rolloutStateInit}}
   randomStateInit: ${resolve_default:True,${...randomStateInit}}
   noisyResetInit: ${resolve_default:True,${...noisyResetInit}}
+  wristPowerWeight: ${resolve_default:0.5,${...wrist_power_weight}}
+  wristPosWeight: ${resolve_default:0.1,${...wrist_pos_weight}}
+  wristAngVelWeight: ${resolve_default:0.05,${...wrist_ang_vel_weight}}
 
   dataIndices: ${resolve_default:[],${...dataIndices}}
   dataDir: ${resolve_default:'',${...data_dir}}
@@ -40,6 +43,7 @@ env:
   tightenMethod: "exp_decay"
   tightenFactor: ${resolve_default:0.7,${...tighten_factor}} # 1.0 means no tightening restriction
   tightenSteps: ${resolve_default:128000,${...tighten_steps}}
+  adaptiveAlpha: ${resolve_default:0.0,${...adaptive_alpha}} # 0.0 = disabled (legacy), 0.9 = p90 adaptive thresholds
 
   # Adaptive sampling
   samplingMethod: ${resolve_default:sonic,${...sampling_method}}  # "sonic" or "mastery"
@@ -50,6 +54,7 @@ env:
   binConvLambda: ${resolve_default:0.8,${...bin_conv_lambda}}
   masteryFloor: ${resolve_default:0.05,${...mastery_floor}}
   twoLevelChunkAlpha: ${resolve_default:0.5,${...twolevel_chunk_alpha}}
+  datasetWeightsPath: ${resolve_default:'',${...dataset_weights_path}}
 
   actionScale: 1.0
   useQuatRot: false
