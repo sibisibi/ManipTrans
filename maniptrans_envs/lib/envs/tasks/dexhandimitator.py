@@ -1390,15 +1390,19 @@ class DexHandImitatorRHEnv(VecTask):
                         env_ptr, k, torch.norm(self.net_cf[env_id, self.dexhand_handles[k]], dim=-1) != 0
                     )
 
-                def add_lines(viewer, env_ptr, hand_joints, color):
+                def add_lines(viewer, env_ptr, hand_joints):
                     assert hand_joints.shape[0] == self.dexhand.n_bodies and hand_joints.shape[1] == 3
                     hand_joints = hand_joints.cpu().numpy()
-                    lines = np.array([[hand_joints[b[0]], hand_joints[b[1]]] for b in self.dexhand.bone_links])
-                    for line in lines:
+                    red = np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
+                    green = np.array([[0.0, 1.0, 0.0]], dtype=np.float32)
+                    thumb_idx = set(range(21, 28))
+                    index_idx = set(range(1, 6))
+                    for b in self.dexhand.bone_links:
+                        line = np.array([[hand_joints[b[0]], hand_joints[b[1]]]])
+                        color = red if (b[0] in thumb_idx or b[1] in thumb_idx or b[0] in index_idx or b[1] in index_idx) else green
                         self.gym.add_lines(viewer, env_ptr, 1, line, color)
 
-                color = np.array([[0.0, 1.0, 0.0]], dtype=np.float32)
-                add_lines(self.viewer, env_ptr, cur_mano_joint_pos[env_id].cpu(), color)
+                add_lines(self.viewer, env_ptr, cur_mano_joint_pos[env_id].cpu())
 
         # ? <<< for visualization
         curr_act_moving_average = self.act_moving_average
