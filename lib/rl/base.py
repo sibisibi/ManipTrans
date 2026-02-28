@@ -1673,6 +1673,7 @@ class MyContinuousA2CBase(MyA2CBase):
                     eval_env = self.vec_env.env
                     if hasattr(eval_env, 'cache_training_state'):
                         self._run_trajectory_eval(eval_env, frame, epoch_num)
+                    self.save(os.path.join(self.nn_dir, f"epoch_{epoch_num}"))
 
                 if epoch_num % self.chunk_metrics_log_every == 0:
                     env = self.vec_env.env
