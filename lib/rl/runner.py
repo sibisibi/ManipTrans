@@ -1,6 +1,7 @@
 from rl_games.torch_runner import Runner as _Runner, _override_sigma
 
 from lib.rl.agent import PPOAgent
+from lib.rl.bc_agent import BCAgent
 from lib.rl.player import MyPPOPlayerContinuous as PPOPlayer
 
 
@@ -17,6 +18,7 @@ class Runner(_Runner):
     def __init__(self, algo_observer=None):
         super().__init__(algo_observer)
         self.algo_factory.register_builder("ppo", lambda **kwargs: PPOAgent(**kwargs))
+        self.algo_factory.register_builder("bc", lambda **kwargs: BCAgent(**kwargs))
         self.player_factory.register_builder("ppo", lambda **kwargs: PPOPlayer(**kwargs))
 
     def run_train(self, args):
