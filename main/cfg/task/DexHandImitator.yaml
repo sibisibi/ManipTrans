@@ -20,6 +20,9 @@ env:
   wristPowerWeight: ${resolve_default:0.5,${...wrist_power_weight}}
   wristPosWeight: ${resolve_default:0.1,${...wrist_pos_weight}}
   wristAngVelWeight: ${resolve_default:0.05,${...wrist_ang_vel_weight}}
+  ringTipWeight: ${resolve_default:0.6,${...ring_tip_weight}}
+  pinkyTipWeight: ${resolve_default:0.6,${...pinky_tip_weight}}
+  level1Weight: ${resolve_default:0.5,${...level_1_weight}}
 
   dataIndices: ${resolve_default:[],${...dataIndices}}
   dataDir: ${resolve_default:'',${...data_dir}}

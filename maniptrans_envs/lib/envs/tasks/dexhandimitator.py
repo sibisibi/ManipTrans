@@ -108,6 +108,9 @@ class DexHandImitatorRHEnv(VecTask):
         self.wrist_power_weight = float(self.cfg["env"].get("wristPowerWeight", 0.5))
         self.wrist_pos_weight = float(self.cfg["env"].get("wristPosWeight", 0.1))
         self.wrist_ang_vel_weight = float(self.cfg["env"].get("wristAngVelWeight", 0.05))
+        self.ring_tip_weight = float(self.cfg["env"].get("ringTipWeight", 0.6))
+        self.pinky_tip_weight = float(self.cfg["env"].get("pinkyTipWeight", 0.6))
+        self.level_1_weight = float(self.cfg["env"].get("level1Weight", 0.5))
 
         self.tighten_method = self.cfg["env"]["tightenMethod"]
         self.tighten_factor = self.cfg["env"]["tightenFactor"]
@@ -1006,6 +1009,9 @@ class DexHandImitatorRHEnv(VecTask):
                 self.wrist_power_weight,
                 self.wrist_pos_weight,
                 self.wrist_ang_vel_weight,
+                self.ring_tip_weight,
+                self.pinky_tip_weight,
+                self.level_1_weight,
             )
         )
         self.total_rew_buf += self.rew_buf
@@ -2446,9 +2452,12 @@ def compute_imitation_reward(
     wrist_power_weight: float,
     wrist_pos_weight: float,
     wrist_ang_vel_weight: float,
+    ring_tip_weight: float,
+    pinky_tip_weight: float,
+    level_1_weight: float,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
 
-    # type: (Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, Tensor], Tensor, Tensor, Dict[str, List[int]], float, float, float) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor]]
+    # type: (Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, Tensor], Tensor, Tensor, Dict[str, List[int]], float, float, float, float, float, float) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor]]
 
     # end effector pose reward
     current_eef_pos = states["base_state"][:, :3]
@@ -2533,9 +2542,9 @@ def compute_imitation_reward(
         + 0.9 * reward_thumb_tip_pos
         + 0.8 * reward_index_tip_pos
         + 0.75 * reward_middle_tip_pos
-        + 0.6 * reward_pinky_tip_pos
-        + 0.6 * reward_ring_tip_pos
-        + 0.5 * reward_level_1_pos
+        + pinky_tip_weight * reward_pinky_tip_pos
+        + ring_tip_weight * reward_ring_tip_pos
+        + level_1_weight * reward_level_1_pos
         + 0.3 * reward_level_2_pos
         + 0.1 * reward_eef_vel
         + wrist_ang_vel_weight * reward_eef_ang_vel
