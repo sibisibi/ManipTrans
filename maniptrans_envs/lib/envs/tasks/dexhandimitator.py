@@ -276,10 +276,12 @@ class DexHandImitatorRHEnv(VecTask):
                 elif len(pt_list) > 1:
                     # Concatenate multiple .pt files
                     temporal_keys = ["wrist_pos", "wrist_rot", "wrist_velocity",
-                                     "wrist_angular_velocity", "mano_joints", "mano_joints_velocity"]
+                                     "wrist_angular_velocity", "mano_joints", "mano_joints_velocity",
+                                     "opt_dof_pos"]
                     merged = {}
                     for k in temporal_keys:
-                        merged[k] = torch.cat([p[k] for p in pt_list], dim=0)
+                        if k in pt_list[0]:
+                            merged[k] = torch.cat([p[k] for p in pt_list], dim=0)
                     merged["motion_num_frames"] = torch.cat([p["motion_num_frames"] for p in pt_list])
                     # Recompute length_starts from merged motion_num_frames
                     nf = merged["motion_num_frames"]
@@ -409,6 +411,8 @@ class DexHandImitatorRHEnv(VecTask):
                 "mano_joints": pt["mano_joints"].to(self.device),
                 "mano_joints_velocity": pt["mano_joints_velocity"].to(self.device),
             }
+            if "opt_dof_pos" in pt:
+                self.demo_data["opt_dof_pos"] = pt["opt_dof_pos"].to(self.device)
 
             # Lightweight proxy for demo_dataset.sequences (needed for chunk-to-seq mapping)
             class _SeqProxy:
@@ -875,6 +879,10 @@ class DexHandImitatorRHEnv(VecTask):
                     )
                 flat_data[k] = torch.cat(chunks, dim=0).to(self.device)
 
+        # opt_dof_pos: flat temporal field (present when retargeting data exists)
+        if "opt_dof_pos" in data[0]:
+            flat_data["opt_dof_pos"] = torch.cat([d["opt_dof_pos"] for d in data], dim=0).to(self.device)
+
         # obj_verts: non-temporal, stack as [num_chunks, 1000, 3]
         if "obj_verts" in data[0]:
             flat_data["obj_verts"] = torch.stack([d["obj_verts"] for d in data]).squeeze().to(self.device)
@@ -1246,16 +1254,28 @@ class DexHandImitatorRHEnv(VecTask):
         else:
             seq_idx = torch.zeros_like(chunk_seq_len.long())
 
+        reset_flat_idx = seq_idx + self.length_starts[self.motion_ids[env_ids]]
+
         if self.noisy_reset_init:
-            noise_dof_pos = (
-                torch.randn_like(self.dexhand_default_dof_pos[None].repeat(len(env_ids), 1))
-                * ((self.dexhand_dof_upper_limits - self.dexhand_dof_lower_limits) / 8)[None]
-            )
-            dof_pos = torch.clamp(
-                self.dexhand_default_dof_pos[None].repeat(len(env_ids), 1) + noise_dof_pos,
-                self.dexhand_dof_lower_limits.unsqueeze(0),
-                self.dexhand_dof_upper_limits.unsqueeze(0),
-            )
+            limits_range = (self.dexhand_dof_upper_limits - self.dexhand_dof_lower_limits) / 8
+            if "opt_dof_pos" in self.demo_data:
+                dof_pos = self.demo_data["opt_dof_pos"][reset_flat_idx]
+                noise_dof_pos = torch.randn_like(dof_pos) * limits_range[None]
+                dof_pos = torch.clamp(
+                    dof_pos + noise_dof_pos,
+                    self.dexhand_dof_lower_limits.unsqueeze(0),
+                    self.dexhand_dof_upper_limits.unsqueeze(0),
+                )
+            else:
+                noise_dof_pos = (
+                    torch.randn_like(self.dexhand_default_dof_pos[None].repeat(len(env_ids), 1))
+                    * limits_range[None]
+                )
+                dof_pos = torch.clamp(
+                    self.dexhand_default_dof_pos[None].repeat(len(env_ids), 1) + noise_dof_pos,
+                    self.dexhand_dof_lower_limits.unsqueeze(0),
+                    self.dexhand_dof_upper_limits.unsqueeze(0),
+                )
             dof_vel = torch.randn([len(env_ids), self.dexhand.n_dofs], device=self.device) * 0.1
             dof_vel = torch.clamp(
                 dof_vel,
@@ -1263,10 +1283,11 @@ class DexHandImitatorRHEnv(VecTask):
                 self._dexhand_dof_speed_limits.unsqueeze(0),
             )
         else:
-            dof_pos = self.dexhand_default_dof_pos[None].repeat(len(env_ids), 1)
+            if "opt_dof_pos" in self.demo_data:
+                dof_pos = self.demo_data["opt_dof_pos"][reset_flat_idx]
+            else:
+                dof_pos = self.dexhand_default_dof_pos[None].repeat(len(env_ids), 1)
             dof_vel = torch.zeros([len(env_ids), self.dexhand.n_dofs], device=self.device)
-
-        reset_flat_idx = seq_idx + self.length_starts[self.motion_ids[env_ids]]
         opt_wrist_pos = self.demo_data["wrist_pos"][reset_flat_idx]
         opt_wrist_rot_aa = self.demo_data["wrist_rot"][reset_flat_idx]
         opt_wrist_vel = self.demo_data["wrist_velocity"][reset_flat_idx]
