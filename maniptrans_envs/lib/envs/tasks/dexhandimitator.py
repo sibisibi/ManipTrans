@@ -1422,11 +1422,16 @@ class DexHandImitatorRHEnv(VecTask):
                     hand_joints = hand_joints.cpu().numpy()
                     red = np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
                     green = np.array([[0.0, 1.0, 0.0]], dtype=np.float32)
-                    thumb_idx = set(range(21, 28))
-                    index_idx = set(range(1, 6))
+                    # Derive thumb/index body indices from dexhand mapping (robot-agnostic)
+                    highlight_bodies = set()
+                    for mano_key, dex_bodies in self.dexhand.hand2dex_mapping.items():
+                        if mano_key.startswith("thumb_") or mano_key.startswith("index_"):
+                            for b_name in dex_bodies:
+                                if b_name in self.dexhand.body_names:
+                                    highlight_bodies.add(self.dexhand.body_names.index(b_name))
                     for b in self.dexhand.bone_links:
                         line = np.array([[hand_joints[b[0]], hand_joints[b[1]]]])
-                        color = red if (b[0] in thumb_idx or b[1] in thumb_idx or b[0] in index_idx or b[1] in index_idx) else green
+                        color = red if (b[0] in highlight_bodies or b[1] in highlight_bodies) else green
                         self.gym.add_lines(viewer, env_ptr, 1, line, color)
 
                 add_lines(self.viewer, env_ptr, cur_mano_joint_pos[env_id].cpu())
