@@ -104,8 +104,12 @@ class DexHandManipRHEnv(VecTask):
         self.rollout_len = self.cfg["env"].get("rolloutLen", None)
         self.rollout_begin = self.cfg["env"].get("rolloutBegin", None)
 
-        assert len(self.dataIndices) == 1 or self.rollout_len is None, "rolloutLen only works with one data"
-        assert len(self.dataIndices) == 1 or self.rollout_begin is None, "rolloutBegin only works with one data"
+        # Flat .pt indexing mode flag (set during _create_envs)
+        self._flat_pt_mode = False
+
+        if not self._flat_pt_mode:
+            assert len(self.dataIndices) == 1 or self.rollout_len is None, "rolloutLen only works with one data"
+            assert len(self.dataIndices) == 1 or self.rollout_begin is None, "rolloutBegin only works with one data"
 
         # Tensor placeholders
         self._root_state = None  # State of root body        (n_envs, 13)
@@ -180,12 +184,15 @@ class DexHandManipRHEnv(VecTask):
         # load BPS model (optional)
         if self.use_bps:
             self.bps_feat_type = "dists"
-            self.bps_layer = bps_torch(
-                bps_type="grid_sphere", n_bps_points=128, radius=0.2, randomize=False, device=self.device
-            )
-
-            obj_verts = self.demo_data["obj_verts"]
-            self.obj_bps = self.bps_layer.encode(obj_verts, feature_type=self.bps_feat_type)[self.bps_feat_type]
+            if self._flat_pt_mode and "obj_bps" in self.demo_data:
+                # Pre-computed BPS from .pt — no need to run bps_torch at init
+                self.obj_bps = self.demo_data["obj_bps"]  # (num_chunks, 128)
+            else:
+                self.bps_layer = bps_torch(
+                    bps_type="grid_sphere", n_bps_points=128, radius=0.2, randomize=False, device=self.device
+                )
+                obj_verts = self.demo_data["obj_verts"]
+                self.obj_bps = self.bps_layer.encode(obj_verts, feature_type=self.bps_feat_type)[self.bps_feat_type]
 
         # Reset all environments
         self.reset_idx(torch.arange(self.num_envs, device=self.device))
@@ -243,20 +250,60 @@ class DexHandManipRHEnv(VecTask):
         mujoco2gym_transf[:3, 3] = np.array([0, 0, self._table_surface_z])
         self.mujoco2gym_transf = torch.tensor(mujoco2gym_transf, device=self.sim_device, dtype=torch.float32)
 
-        dataset_list = list(set([ManipDataFactory.dataset_type(data_idx) for data_idx in self.dataIndices]))
+        # --- Detect .pt loading mode ---
+        index_path = self.cfg["env"].get("indexPath", "")
+        self._precomputed_pt = None
+        if index_path:
+            data_dir = self.cfg["env"].get("dataDir", "")
+            assert data_dir, "dataDir must be set when using indexPath"
+            pt_paths = [p.strip() for p in index_path.split(",")]
+            if all(p.endswith(".pt") for p in pt_paths):
+                pt_list = []
+                for pt_rel in pt_paths:
+                    pt_path = os.path.join(data_dir, pt_rel)
+                    print(f"Loading pre-computed .pt: {pt_path}")
+                    pt_data = torch.load(pt_path, map_location="cpu", weights_only=False)
+                    if "motion_num_frames" not in pt_data:
+                        print("  Old .pt format detected, falling back to dataset")
+                        pt_list = []
+                        break
+                    print(f"  {len(pt_data['motion_num_frames']):,} chunks, "
+                          f"{pt_data['wrist_pos'].shape[0]:,} frames")
+                    pt_list.append(pt_data)
 
-        self.demo_dataset_dict = {}
-        for dataset_type in dataset_list:
-            self.demo_dataset_dict[dataset_type] = ManipDataFactory.create_data(
-                manipdata_type=dataset_type,
-                side=self.side,
-                device=self.sim_device,
-                mujoco2gym_transf=self.mujoco2gym_transf,
-                max_seq_len=self.max_episode_length,
-                dexhand=self.dexhand,
-                embodiment=self.cfg["env"]["dexhand"],
-            )
+                if len(pt_list) == 1:
+                    self._precomputed_pt = pt_list[0]
+                elif len(pt_list) > 1:
+                    temporal_keys = [
+                        "wrist_pos", "wrist_rot", "wrist_velocity", "wrist_angular_velocity",
+                        "mano_joints", "mano_joints_velocity",
+                        "obj_trajectory", "obj_velocity", "obj_angular_velocity",
+                        "tips_distance", "opt_dof_pos",
+                    ]
+                    merged = {}
+                    for k in temporal_keys:
+                        if k in pt_list[0]:
+                            merged[k] = torch.cat([p[k] for p in pt_list], dim=0)
+                    merged["motion_num_frames"] = torch.cat([p["motion_num_frames"] for p in pt_list])
+                    nf = merged["motion_num_frames"]
+                    ls = torch.zeros(len(nf), dtype=torch.int64)
+                    if len(nf) > 1:
+                        ls[1:] = torch.cumsum(nf[:-1], dim=0)
+                    merged["length_starts"] = ls
+                    # Per-chunk fields
+                    for k in ["obj_verts", "obj_bps"]:
+                        if k in pt_list[0]:
+                            merged[k] = torch.cat([p[k] for p in pt_list], dim=0)
+                    for k in ["datasets", "filenames", "splits", "obj_id", "obj_urdf_path"]:
+                        merged[k] = sum([p[k] for p in pt_list], [])
+                    self._precomputed_pt = merged
+                    print(f"Merged {len(pt_list)} .pt files: {len(nf):,} chunks, "
+                          f"{merged['wrist_pos'].shape[0]:,} frames")
 
+        if self._precomputed_pt is None and not self.dataIndices:
+            raise ValueError("Either indexPath (.pt) or dataIndices must be provided")
+
+        # --- Load dexhand asset (shared for all modes) ---
         dexhand_asset_file = self.dexhand.urdf_path
         asset_options = gymapi.AssetOptions()
         asset_options.thickness = 0.001
@@ -329,17 +376,90 @@ class DexHandManipRHEnv(VecTask):
         self.dexhand_rs = []
         self.envs = []
 
-        assert len(self.dataIndices) == 1 or not self.rollout_state_init, "rollout_state_init only works with one data"
+        # --- Load demo data ---
+        if self._precomputed_pt is not None:
+            # Pre-computed .pt fast path
+            pt = self._precomputed_pt
+            num_chunks = len(pt["motion_num_frames"])
+            assert num_chunks > 0, "Pre-computed .pt is empty"
+            self._flat_pt_mode = True
 
-        dataset_list = list(set([ManipDataFactory.dataset_type(data_idx) for data_idx in self.dataIndices]))
+            self.motion_num_frames = pt["motion_num_frames"].to(self.device)
+            self.length_starts = pt["length_starts"].to(self.device)
+            self.num_chunks = num_chunks
 
-        def segment_data(k):
-            todo_list = self.dataIndices
-            idx = todo_list[k % len(todo_list)]
-            return self.demo_dataset_dict[ManipDataFactory.dataset_type(idx)][idx]
+            # Temporal flat fields
+            self.demo_data = {
+                "wrist_pos": pt["wrist_pos"].to(self.device),
+                "wrist_rot": pt["wrist_rot"].to(self.device),
+                "wrist_velocity": pt["wrist_velocity"].to(self.device),
+                "wrist_angular_velocity": pt["wrist_angular_velocity"].to(self.device),
+                "mano_joints": pt["mano_joints"].to(self.device),
+                "mano_joints_velocity": pt["mano_joints_velocity"].to(self.device),
+                "obj_trajectory": pt["obj_trajectory"].to(self.device),
+                "obj_velocity": pt["obj_velocity"].to(self.device),
+                "obj_angular_velocity": pt["obj_angular_velocity"].to(self.device),
+                "tips_distance": pt["tips_distance"].to(self.device),
+            }
+            if "opt_dof_pos" in pt:
+                self.demo_data["opt_dof_pos"] = pt["opt_dof_pos"].to(self.device)
 
-        self.demo_data = [segment_data(i) for i in tqdm(range(self.num_envs))]
-        self.demo_data = self.pack_data(self.demo_data)
+            # Per-chunk fields
+            if "obj_verts" in pt:
+                self.demo_data["obj_verts"] = pt["obj_verts"].to(self.device)
+            if "obj_bps" in pt:
+                self.demo_data["obj_bps"] = pt["obj_bps"].to(self.device)
+
+            # Per-chunk metadata (lists, stay on CPU)
+            self.demo_data["obj_id"] = pt["obj_id"]
+            self.demo_data["obj_urdf_path"] = pt["obj_urdf_path"]
+            self.demo_data["scene_objs"] = [[] for _ in range(num_chunks)]  # no scene objects in .pt
+
+            # Assign initial motion_ids
+            self.sampling_weights = torch.ones(num_chunks, device=self.device)
+            self.motion_ids = torch.multinomial(
+                self.sampling_weights, self.num_envs, replacement=True
+            )
+
+            # Per-chunk tracking (required by checkpoint save/restore in base.py)
+            self.chunk_success_count = torch.zeros(num_chunks, device=self.device)
+            self.chunk_fail_count = torch.zeros(num_chunks, device=self.device)
+            self.chunk_eval_count = torch.zeros(num_chunks, device=self.device)
+            self.chunk_completion_sum = torch.zeros(num_chunks, device=self.device)
+            self.chunk_reward_sum = torch.zeros(num_chunks, device=self.device)
+            self.chunk_eval_count_global = torch.zeros(num_chunks, device=self.device)
+            self.chunk_success_count_global = torch.zeros(num_chunks, device=self.device)
+            self.chunk_completion_sum_global = torch.zeros(num_chunks, device=self.device)
+
+            del self._precomputed_pt
+
+            print(f"Pre-computed .pt loaded: {num_chunks:,} chunks, "
+                  f"{self.demo_data['wrist_pos'].shape[0]:,} frames (instant)")
+        else:
+            # Legacy dataIndices mode
+            self._flat_pt_mode = False
+            assert len(self.dataIndices) == 1 or not self.rollout_state_init, "rollout_state_init only works with one data"
+
+            dataset_list = list(set([ManipDataFactory.dataset_type(data_idx) for data_idx in self.dataIndices]))
+            self.demo_dataset_dict = {}
+            for dataset_type in dataset_list:
+                self.demo_dataset_dict[dataset_type] = ManipDataFactory.create_data(
+                    manipdata_type=dataset_type,
+                    side=self.side,
+                    device=self.sim_device,
+                    mujoco2gym_transf=self.mujoco2gym_transf,
+                    max_seq_len=self.max_episode_length,
+                    dexhand=self.dexhand,
+                    embodiment=self.cfg["env"]["dexhand"],
+                )
+
+            def segment_data(k):
+                todo_list = self.dataIndices
+                idx = todo_list[k % len(todo_list)]
+                return self.demo_dataset_dict[ManipDataFactory.dataset_type(idx)][idx]
+
+            self.demo_data = [segment_data(i) for i in tqdm(range(self.num_envs))]
+            self.demo_data = self.pack_data(self.demo_data)
 
         # Create environments
         self.manip_obj_mass = []
@@ -571,8 +691,15 @@ class DexHandManipRHEnv(VecTask):
                 for k, v in self._prop_dump_info.items()
             }
 
+    def _get_chunk_idx(self, env_i):
+        """Map env index to chunk index (flat mode uses motion_ids, legacy uses env_i directly)."""
+        if self._flat_pt_mode:
+            return self.motion_ids[env_i].item()
+        return env_i
+
     def _create_obj_assets(self, i):
-        obj_id = self.demo_data["obj_id"][i]
+        chunk_idx = self._get_chunk_idx(i)
+        obj_id = self.demo_data["obj_id"][chunk_idx]
 
         if obj_id in self.objs_assets:
             current_asset = self.objs_assets[obj_id]
@@ -591,7 +718,7 @@ class DexHandManipRHEnv(VecTask):
             asset_options.vhacd_params.resolution = 200000
             asset_options.density = 200  # * the average density of low-fill-rate 3D-printed models
             current_asset = self.gym.load_asset(
-                self.sim, *os.path.split(self.demo_data["obj_urdf_path"][i]), asset_options
+                self.sim, *os.path.split(self.demo_data["obj_urdf_path"][chunk_idx]), asset_options
             )
 
             rigid_shape_props_asset = self.gym.get_asset_rigid_shape_properties(current_asset)
@@ -618,8 +745,14 @@ class DexHandManipRHEnv(VecTask):
         return current_asset, sum_rigid_body_count, sum_rigid_shape_count, scale, mass
 
     def _create_obj_actor(self, env_ptr, i, current_asset):
+        chunk_idx = self._get_chunk_idx(i)
 
-        obj_transf = self.demo_data["obj_trajectory"][i][0]
+        if self._flat_pt_mode:
+            # In flat mode, obj_trajectory is (total_frames, 4, 4); get the first frame of this chunk
+            flat_start = self.length_starts[self.motion_ids[i]].item()
+            obj_transf = self.demo_data["obj_trajectory"][flat_start]
+        else:
+            obj_transf = self.demo_data["obj_trajectory"][i][0]
 
         pose = gymapi.Transform()
         pose.p = gymapi.Vec3(obj_transf[0, 3], obj_transf[1, 3], obj_transf[2, 3])
@@ -632,7 +765,7 @@ class DexHandManipRHEnv(VecTask):
         obj_actor = self.gym.create_actor(env_ptr, current_asset, pose, "manip_obj", i, 0)
         obj_index = self.gym.get_actor_index(env_ptr, obj_actor, gymapi.DOMAIN_SIM)
 
-        scene_objs = self.demo_data["scene_objs"][i]
+        scene_objs = self.demo_data["scene_objs"][chunk_idx]
         scene_asset_options = gymapi.AssetOptions()
         scene_asset_options.fix_base_link = True
 
@@ -767,32 +900,54 @@ class DexHandManipRHEnv(VecTask):
         # Refresh states
         self._update_states()
 
+    def _flat_idx(self, cur_idx):
+        """Convert per-env progress indices to flat indices (for flat .pt mode)."""
+        return cur_idx + self.length_starts[self.motion_ids]
+
+    def _get_max_length(self):
+        """Get per-env max sequence length."""
+        if self._flat_pt_mode:
+            return torch.clip(self.motion_num_frames[self.motion_ids], 0, self.max_episode_length).float()
+        return torch.clip(self.demo_data["seq_len"], 0, self.max_episode_length).float()
+
+    def _index_demo(self, key, idx):
+        """Index demo_data by idx. In flat mode, idx is already flat. In legacy mode, uses [env, timestep]."""
+        if self._flat_pt_mode:
+            return self.demo_data[key][idx]
+        return self.demo_data[key][torch.arange(self.num_envs, device=idx.device), idx]
+
     def compute_reward(self, actions):
         target_state = {}
-        max_length = torch.clip(self.demo_data["seq_len"], 0, self.max_episode_length).float()
+        max_length = self._get_max_length()
         cur_idx = self.progress_buf
-        cur_wrist_pos = self.demo_data["wrist_pos"][torch.arange(self.num_envs), cur_idx]
+        if self._flat_pt_mode:
+            cur_idx = torch.clamp(cur_idx, max=self.motion_num_frames[self.motion_ids] - 1)
+            flat_idx = self._flat_idx(cur_idx)
+        else:
+            flat_idx = cur_idx
+
+        cur_wrist_pos = self._index_demo("wrist_pos", flat_idx)
         target_state["wrist_pos"] = cur_wrist_pos
-        cur_wrist_rot = self.demo_data["wrist_rot"][torch.arange(self.num_envs), cur_idx]
+        cur_wrist_rot = self._index_demo("wrist_rot", flat_idx)
         target_state["wrist_quat"] = aa_to_quat(cur_wrist_rot)[:, [1, 2, 3, 0]]
 
-        target_state["wrist_vel"] = self.demo_data["wrist_velocity"][torch.arange(self.num_envs), cur_idx]
-        target_state["wrist_ang_vel"] = self.demo_data["wrist_angular_velocity"][torch.arange(self.num_envs), cur_idx]
+        target_state["wrist_vel"] = self._index_demo("wrist_velocity", flat_idx)
+        target_state["wrist_ang_vel"] = self._index_demo("wrist_angular_velocity", flat_idx)
 
-        target_state["tips_distance"] = self.demo_data["tips_distance"][torch.arange(self.num_envs), cur_idx]
+        target_state["tips_distance"] = self._index_demo("tips_distance", flat_idx)
 
-        cur_joints_pos = self.demo_data["mano_joints"][torch.arange(self.num_envs), cur_idx]
+        cur_joints_pos = self._index_demo("mano_joints", flat_idx)
         target_state["joints_pos"] = cur_joints_pos.reshape(self.num_envs, -1, 3)
-        target_state["joints_vel"] = self.demo_data["mano_joints_velocity"][
-            torch.arange(self.num_envs), cur_idx
-        ].reshape(self.num_envs, -1, 3)
+        target_state["joints_vel"] = self._index_demo("mano_joints_velocity", flat_idx).reshape(
+            self.num_envs, -1, 3
+        )
 
-        cur_obj_transf = self.demo_data["obj_trajectory"][torch.arange(self.num_envs), cur_idx]
+        cur_obj_transf = self._index_demo("obj_trajectory", flat_idx)
         target_state["manip_obj_pos"] = cur_obj_transf[:, :3, 3]
         target_state["manip_obj_quat"] = rotmat_to_quat(cur_obj_transf[:, :3, :3])[:, [1, 2, 3, 0]]
 
-        target_state["manip_obj_vel"] = self.demo_data["obj_velocity"][torch.arange(self.num_envs), cur_idx]
-        target_state["manip_obj_ang_vel"] = self.demo_data["obj_angular_velocity"][torch.arange(self.num_envs), cur_idx]
+        target_state["manip_obj_vel"] = self._index_demo("obj_velocity", flat_idx)
+        target_state["manip_obj_ang_vel"] = self._index_demo("obj_angular_velocity", flat_idx)
 
         target_state["tip_force"] = torch.stack(
             [self.net_cf[:, self.dexhand_handles[k], :] for k in self.dexhand.contact_body_names],
@@ -914,34 +1069,54 @@ class DexHandManipRHEnv(VecTask):
 
         next_target_state = {}
 
-        cur_idx = self.progress_buf + 1
-        cur_idx = torch.clamp(cur_idx, torch.zeros_like(self.demo_data["seq_len"]), self.demo_data["seq_len"] - 1)
-
-        cur_idx = torch.stack(
-            [cur_idx + t for t in range(self.obs_future_length)], dim=-1
-        )  # [B, K], K = obs_future_length
-        nE, nT = self.demo_data["wrist_pos"].shape[:2]
+        nE = self.num_envs
         nF = self.obs_future_length
 
-        def indicing(data, idx):
-            assert data.shape[0] == nE and data.shape[1] == nT
-            remaining_shape = data.shape[2:]
-            expanded_idx = idx
-            for _ in remaining_shape:
-                expanded_idx = expanded_idx.unsqueeze(-1)
-            expanded_idx = expanded_idx.expand(-1, -1, *remaining_shape)
-            return torch.gather(data, 1, expanded_idx)
+        if self._flat_pt_mode:
+            # Flat indexing: build future indices as flat offsets
+            seq_len = self.motion_num_frames[self.motion_ids]  # [B]
+            cur_idx_base = self.progress_buf + 1
+            cur_idx_base = torch.clamp(cur_idx_base, max=seq_len - 1)
+            # Stack future frames: [B, K]
+            cur_idx_stack = torch.stack(
+                [torch.clamp(cur_idx_base + t, max=seq_len - 1) for t in range(nF)], dim=-1
+            )
+            offsets = self.length_starts[self.motion_ids].unsqueeze(1)  # [B, 1]
+            flat_future_idx = cur_idx_stack + offsets  # [B, K]
 
-        target_wrist_pos = indicing(self.demo_data["wrist_pos"], cur_idx)  # [B, K, 3]
+            def indicing_flat(key, idx):
+                """Index flat demo data: data[flat_idx] -> [B, K, ...]"""
+                return self.demo_data[key][idx]  # idx is [B, K], advanced indexing gives [B, K, ...]
+        else:
+            cur_idx = self.progress_buf + 1
+            cur_idx = torch.clamp(cur_idx, torch.zeros_like(self.demo_data["seq_len"]), self.demo_data["seq_len"] - 1)
+            cur_idx = torch.stack(
+                [cur_idx + t for t in range(nF)], dim=-1
+            )  # [B, K]
+            _nE, nT = self.demo_data["wrist_pos"].shape[:2]
+            flat_future_idx = cur_idx  # used as 2D gather index below
+
+            def indicing_flat(key, idx):
+                """Legacy gather-based indexing for [num_envs, max_len, ...] data."""
+                data = self.demo_data[key]
+                assert data.shape[0] == _nE and data.shape[1] == nT
+                remaining_shape = data.shape[2:]
+                expanded_idx = idx
+                for _ in remaining_shape:
+                    expanded_idx = expanded_idx.unsqueeze(-1)
+                expanded_idx = expanded_idx.expand(-1, -1, *remaining_shape)
+                return torch.gather(data, 1, expanded_idx)
+
+        target_wrist_pos = indicing_flat("wrist_pos", flat_future_idx)  # [B, K, 3]
         cur_wrist_pos = self.states["base_state"][:, :3]  # [B, 3]
         next_target_state["delta_wrist_pos"] = (target_wrist_pos - cur_wrist_pos[:, None]).reshape(nE, -1)
 
-        target_wrist_vel = indicing(self.demo_data["wrist_velocity"], cur_idx)
+        target_wrist_vel = indicing_flat("wrist_velocity", flat_future_idx)
         cur_wrist_vel = self.states["base_state"][:, 7:10]
         next_target_state["wrist_vel"] = target_wrist_vel.reshape(nE, -1)
         next_target_state["delta_wrist_vel"] = (target_wrist_vel - cur_wrist_vel[:, None]).reshape(nE, -1)
 
-        target_wrist_rot = indicing(self.demo_data["wrist_rot"], cur_idx)
+        target_wrist_rot = indicing_flat("wrist_rot", flat_future_idx)
         cur_wrist_rot = self.states["base_state"][:, 3:7]
 
         next_target_state["wrist_quat"] = aa_to_quat(target_wrist_rot.reshape(nE * nF, -1))[:, [1, 2, 3, 0]]
@@ -951,27 +1126,27 @@ class DexHandManipRHEnv(VecTask):
         ).reshape(nE, -1)
         next_target_state["wrist_quat"] = next_target_state["wrist_quat"].reshape(nE, -1)
 
-        target_wrist_ang_vel = indicing(self.demo_data["wrist_angular_velocity"], cur_idx)
+        target_wrist_ang_vel = indicing_flat("wrist_angular_velocity", flat_future_idx)
         cur_wrist_ang_vel = self.states["base_state"][:, 10:13]
         next_target_state["wrist_ang_vel"] = target_wrist_ang_vel.reshape(nE, -1)
         next_target_state["delta_wrist_ang_vel"] = (target_wrist_ang_vel - cur_wrist_ang_vel[:, None]).reshape(nE, -1)
 
-        target_joints_pos = indicing(self.demo_data["mano_joints"], cur_idx).reshape(nE, nF, -1, 3)
+        target_joints_pos = indicing_flat("mano_joints", flat_future_idx).reshape(nE, nF, -1, 3)
         cur_joint_pos = self.states["joints_state"][:, 1:, :3]  # skip the base joint
         next_target_state["delta_joints_pos"] = (target_joints_pos - cur_joint_pos[:, None]).reshape(self.num_envs, -1)
 
-        target_joints_vel = indicing(self.demo_data["mano_joints_velocity"], cur_idx).reshape(nE, nF, -1, 3)
+        target_joints_vel = indicing_flat("mano_joints_velocity", flat_future_idx).reshape(nE, nF, -1, 3)
         cur_joint_vel = self.states["joints_state"][:, 1:, 7:10]  # skip the base joint
         next_target_state["joints_vel"] = target_joints_vel.reshape(self.num_envs, -1)
         next_target_state["delta_joints_vel"] = (target_joints_vel - cur_joint_vel[:, None]).reshape(self.num_envs, -1)
 
-        target_obj_transf = indicing(self.demo_data["obj_trajectory"], cur_idx)
+        target_obj_transf = indicing_flat("obj_trajectory", flat_future_idx)
         target_obj_transf = target_obj_transf.reshape(nE * nF, 4, 4)
         next_target_state["delta_manip_obj_pos"] = (
             target_obj_transf[:, :3, 3].reshape(nE, nF, -1) - self.states["manip_obj_pos"][:, None]
         ).reshape(nE, -1)
 
-        target_obj_vel = indicing(self.demo_data["obj_velocity"], cur_idx)
+        target_obj_vel = indicing_flat("obj_velocity", flat_future_idx)
         cur_obj_vel = self.states["manip_obj_vel"]
         next_target_state["manip_obj_vel"] = target_obj_vel.reshape(nE, -1)
         next_target_state["delta_manip_obj_vel"] = (target_obj_vel - cur_obj_vel[:, None]).reshape(nE, -1)
@@ -983,7 +1158,7 @@ class DexHandManipRHEnv(VecTask):
         ).reshape(nE, -1)
         next_target_state["manip_obj_quat"] = next_target_state["manip_obj_quat"].reshape(nE, -1)
 
-        target_obj_ang_vel = indicing(self.demo_data["obj_angular_velocity"], cur_idx)
+        target_obj_ang_vel = indicing_flat("obj_angular_velocity", flat_future_idx)
         cur_obj_ang_vel = self.states["manip_obj_ang_vel"]
         next_target_state["manip_obj_ang_vel"] = target_obj_ang_vel.reshape(nE, -1)
         next_target_state["delta_manip_obj_ang_vel"] = (target_obj_ang_vel - cur_obj_ang_vel[:, None]).reshape(nE, -1)
@@ -992,7 +1167,7 @@ class DexHandManipRHEnv(VecTask):
             self.states["manip_obj_pos"][:, None] - self.states["joints_state"][:, :, :3], dim=-1
         ).reshape(self.num_envs, -1)
 
-        next_target_state["gt_tips_distance"] = indicing(self.demo_data["tips_distance"], cur_idx).reshape(nE, -1)
+        next_target_state["gt_tips_distance"] = indicing_flat("tips_distance", flat_future_idx).reshape(nE, -1)
 
         obs_keys = [  # ! must be in the same order as the following
             "delta_wrist_pos",
@@ -1016,7 +1191,11 @@ class DexHandManipRHEnv(VecTask):
             "gt_tips_distance",
         ]
         if self.use_bps:
-            next_target_state["bps"] = self.obj_bps
+            if self._flat_pt_mode:
+                # Per-chunk BPS indexed by motion_ids
+                next_target_state["bps"] = self.obj_bps[self.motion_ids]
+            else:
+                next_target_state["bps"] = self.obj_bps
             obs_keys.append("bps")
         self.obs_dict["target"][:] = torch.cat(
             [next_target_state[ob] for ob in obs_keys],
@@ -1053,52 +1232,99 @@ class DexHandManipRHEnv(VecTask):
         return self.obs_dict
 
     def _reset_default(self, env_ids):
-        if self.random_state_init:
-            if self.rollout_begin is not None:
-                seq_idx = (
-                    torch.floor(
-                        self.rollout_len * 0.98 * torch.rand_like(self.demo_data["seq_len"][env_ids].float())
-                    ).long()
-                    + self.rollout_begin
-                )
-                seq_idx = torch.clamp(
-                    seq_idx,
-                    torch.zeros(1, device=self.device).long(),
-                    torch.floor(self.demo_data["seq_len"][env_ids] * 0.98).long(),
-                )
-            else:
+        if self._flat_pt_mode:
+            # Flat .pt mode: use motion_num_frames for per-chunk lengths
+            chunk_seq_len = self.motion_num_frames[self.motion_ids[env_ids]]
+
+            if self.random_state_init:
                 seq_idx = torch.floor(
-                    self.demo_data["seq_len"][env_ids]
-                    * 0.98
-                    * torch.rand_like(self.demo_data["seq_len"][env_ids].float())
+                    chunk_seq_len.float() * 0.98 * torch.rand(len(env_ids), device=self.device)
                 ).long()
-        else:
-            if self.rollout_begin is not None:
-                seq_idx = self.rollout_begin * torch.ones_like(self.demo_data["seq_len"][env_ids].long())
             else:
-                seq_idx = torch.zeros_like(self.demo_data["seq_len"][env_ids].long())
+                seq_idx = torch.zeros(len(env_ids), dtype=torch.long, device=self.device)
 
-        dof_pos = self.demo_data["opt_dof_pos"][env_ids, seq_idx]
-        dof_pos = torch_jit_utils.tensor_clamp(
-            dof_pos,
-            self.dexhand_dof_lower_limits.unsqueeze(0),
-            self.dexhand_dof_upper_limits.unsqueeze(0),
-        )
-        dof_vel = self.demo_data["opt_dof_velocity"][env_ids, seq_idx]
-        dof_vel = torch_jit_utils.tensor_clamp(
-            dof_vel,
-            -1 * self._dexhand_dof_speed_limits.unsqueeze(0),
-            self._dexhand_dof_speed_limits.unsqueeze(0),
-        )
+            reset_flat_idx = seq_idx + self.length_starts[self.motion_ids[env_ids]]
 
-        opt_wrist_pos = self.demo_data["opt_wrist_pos"][env_ids, seq_idx]
-        opt_wrist_rot = aa_to_quat(self.demo_data["opt_wrist_rot"][env_ids, seq_idx])
-        opt_wrist_rot = opt_wrist_rot[:, [1, 2, 3, 0]]
+            dof_pos = self.demo_data["opt_dof_pos"][reset_flat_idx]
+            dof_pos = torch_jit_utils.tensor_clamp(
+                dof_pos,
+                self.dexhand_dof_lower_limits.unsqueeze(0),
+                self.dexhand_dof_upper_limits.unsqueeze(0),
+            )
+            # No pre-computed dof velocity in .pt — use zeros
+            dof_vel = torch.zeros_like(dof_pos)
 
-        opt_wrist_vel = self.demo_data["opt_wrist_velocity"][env_ids, seq_idx]
-        opt_wrist_ang_vel = self.demo_data["opt_wrist_angular_velocity"][env_ids, seq_idx]
+            # In .pt, wrist_pos/rot IS the retargeted data
+            opt_wrist_pos = self.demo_data["wrist_pos"][reset_flat_idx]
+            opt_wrist_rot = aa_to_quat(self.demo_data["wrist_rot"][reset_flat_idx])
+            opt_wrist_rot = opt_wrist_rot[:, [1, 2, 3, 0]]
 
-        opt_hand_pose_vel = torch.concat([opt_wrist_pos, opt_wrist_rot, opt_wrist_vel, opt_wrist_ang_vel], dim=-1)
+            opt_wrist_vel = self.demo_data["wrist_velocity"][reset_flat_idx]
+            opt_wrist_ang_vel = self.demo_data["wrist_angular_velocity"][reset_flat_idx]
+
+            opt_hand_pose_vel = torch.concat([opt_wrist_pos, opt_wrist_rot, opt_wrist_vel, opt_wrist_ang_vel], dim=-1)
+
+            # Object reset from flat data
+            obj_transf = self.demo_data["obj_trajectory"][reset_flat_idx]
+            obj_pos_init = obj_transf[:, :3, 3]
+            obj_rot_init = rotmat_to_quat(obj_transf[:, :3, :3])[:, [1, 2, 3, 0]]
+            obj_vel = self.demo_data["obj_velocity"][reset_flat_idx]
+            obj_ang_vel = self.demo_data["obj_angular_velocity"][reset_flat_idx]
+        else:
+            # Legacy per-sequence mode
+            if self.random_state_init:
+                if self.rollout_begin is not None:
+                    seq_idx = (
+                        torch.floor(
+                            self.rollout_len * 0.98 * torch.rand_like(self.demo_data["seq_len"][env_ids].float())
+                        ).long()
+                        + self.rollout_begin
+                    )
+                    seq_idx = torch.clamp(
+                        seq_idx,
+                        torch.zeros(1, device=self.device).long(),
+                        torch.floor(self.demo_data["seq_len"][env_ids] * 0.98).long(),
+                    )
+                else:
+                    seq_idx = torch.floor(
+                        self.demo_data["seq_len"][env_ids]
+                        * 0.98
+                        * torch.rand_like(self.demo_data["seq_len"][env_ids].float())
+                    ).long()
+            else:
+                if self.rollout_begin is not None:
+                    seq_idx = self.rollout_begin * torch.ones_like(self.demo_data["seq_len"][env_ids].long())
+                else:
+                    seq_idx = torch.zeros_like(self.demo_data["seq_len"][env_ids].long())
+
+            dof_pos = self.demo_data["opt_dof_pos"][env_ids, seq_idx]
+            dof_pos = torch_jit_utils.tensor_clamp(
+                dof_pos,
+                self.dexhand_dof_lower_limits.unsqueeze(0),
+                self.dexhand_dof_upper_limits.unsqueeze(0),
+            )
+            dof_vel = self.demo_data["opt_dof_velocity"][env_ids, seq_idx]
+            dof_vel = torch_jit_utils.tensor_clamp(
+                dof_vel,
+                -1 * self._dexhand_dof_speed_limits.unsqueeze(0),
+                self._dexhand_dof_speed_limits.unsqueeze(0),
+            )
+
+            opt_wrist_pos = self.demo_data["opt_wrist_pos"][env_ids, seq_idx]
+            opt_wrist_rot = aa_to_quat(self.demo_data["opt_wrist_rot"][env_ids, seq_idx])
+            opt_wrist_rot = opt_wrist_rot[:, [1, 2, 3, 0]]
+
+            opt_wrist_vel = self.demo_data["opt_wrist_velocity"][env_ids, seq_idx]
+            opt_wrist_ang_vel = self.demo_data["opt_wrist_angular_velocity"][env_ids, seq_idx]
+
+            opt_hand_pose_vel = torch.concat([opt_wrist_pos, opt_wrist_rot, opt_wrist_vel, opt_wrist_ang_vel], dim=-1)
+
+            # Object reset
+            obj_pos_init = self.demo_data["obj_trajectory"][env_ids, seq_idx, :3, 3]
+            obj_rot_init = self.demo_data["obj_trajectory"][env_ids, seq_idx, :3, :3]
+            obj_rot_init = rotmat_to_quat(obj_rot_init)[:, [1, 2, 3, 0]]
+            obj_vel = self.demo_data["obj_velocity"][env_ids, seq_idx]
+            obj_ang_vel = self.demo_data["obj_angular_velocity"][env_ids, seq_idx]
 
         self._base_state[env_ids, :] = opt_hand_pose_vel
 
@@ -1107,15 +1333,6 @@ class DexHandManipRHEnv(VecTask):
         self._pos_control[env_ids, :] = dof_pos
 
         # reset manip obj
-        obj_pos_init = self.demo_data["obj_trajectory"][env_ids, seq_idx, :3, 3]
-        obj_rot_init = self.demo_data["obj_trajectory"][env_ids, seq_idx, :3, :3]
-        obj_rot_init = rotmat_to_quat(obj_rot_init)
-        # [w, x, y, z] to [x, y, z, w]
-        obj_rot_init = obj_rot_init[:, [1, 2, 3, 0]]
-
-        obj_vel = self.demo_data["obj_velocity"][env_ids, seq_idx]
-        obj_ang_vel = self.demo_data["obj_angular_velocity"][env_ids, seq_idx]
-
         self._manip_obj_root_state[env_ids, :3] = obj_pos_init
         self._manip_obj_root_state[env_ids, 3:7] = obj_rot_init
         self._manip_obj_root_state[env_ids, 7:10] = obj_vel
@@ -1168,14 +1385,20 @@ class DexHandManipRHEnv(VecTask):
         if self.randomize:
             self.apply_randomizations(self.dr_randomizations)
 
-        last_step = self.gym.get_frame_count(self.sim)
-        if self.training and len(self.dataIndices) == 1 and last_step >= self.tighten_steps:
-            running_steps = self.running_progress_buf[env_ids] - 1
-            max_running_steps, max_running_idx = running_steps.max(dim=0)
-            max_running_env_id = env_ids[max_running_idx]
-            if max_running_steps > self.best_rollout_len:
-                self.best_rollout_len = max_running_steps
-                self.best_rollout_begin = self.progress_buf[max_running_env_id] - 1 - max_running_steps
+        if self._flat_pt_mode:
+            # Reassign motion_ids for reset envs (sample new chunks)
+            self.motion_ids[env_ids] = torch.randint(
+                0, self.num_chunks, (len(env_ids),), device=self.device
+            )
+        else:
+            last_step = self.gym.get_frame_count(self.sim)
+            if self.training and len(self.dataIndices) == 1 and last_step >= self.tighten_steps:
+                running_steps = self.running_progress_buf[env_ids] - 1
+                max_running_steps, max_running_idx = running_steps.max(dim=0)
+                max_running_env_id = env_ids[max_running_idx]
+                if max_running_steps > self.best_rollout_len:
+                    self.best_rollout_len = max_running_steps
+                    self.best_rollout_begin = self.progress_buf[max_running_env_id] - 1 - max_running_steps
 
         self._reset_default(env_ids)
 
@@ -1210,11 +1433,18 @@ class DexHandManipRHEnv(VecTask):
 
             self.gym.clear_lines(self.viewer)
 
-            cur_wrist_pos = self.demo_data["wrist_pos"][torch.arange(self.num_envs), cur_idx]
-
-            cur_mano_joint_pos = self.demo_data["mano_joints"][torch.arange(self.num_envs), cur_idx].reshape(
-                self.num_envs, -1, 3
-            )
+            if self._flat_pt_mode:
+                vis_idx = torch.clamp(cur_idx, max=self.motion_num_frames[self.motion_ids] - 1)
+                vis_flat_idx = self._flat_idx(vis_idx)
+                cur_wrist_pos = self.demo_data["wrist_pos"][vis_flat_idx]
+                cur_mano_joint_pos = self.demo_data["mano_joints"][vis_flat_idx].reshape(
+                    self.num_envs, -1, 3
+                )
+            else:
+                cur_wrist_pos = self.demo_data["wrist_pos"][torch.arange(self.num_envs), cur_idx]
+                cur_mano_joint_pos = self.demo_data["mano_joints"][torch.arange(self.num_envs), cur_idx].reshape(
+                    self.num_envs, -1, 3
+                )
             cur_mano_joint_pos = torch.concat([cur_wrist_pos[:, None], cur_mano_joint_pos], dim=1)
             for k in range(len(self.mano_joint_points)):
                 self.mano_joint_points[k][:, :3] = cur_mano_joint_pos[:, k]
