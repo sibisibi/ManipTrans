@@ -412,7 +412,15 @@ class DexHandManipRHEnv(VecTask):
 
             # Per-chunk metadata (lists, stay on CPU)
             self.demo_data["obj_id"] = pt["obj_id"]
-            self.demo_data["obj_urdf_path"] = pt["obj_urdf_path"]
+
+            # obj_urdf_path in .pt is relative (e.g. oakink2/O02@0032@00001/collision.urdf).
+            # Prepend obj_dir to get absolute paths.
+            raw_paths = pt["obj_urdf_path"]
+            obj_dir = self.cfg["env"].get("objDir", "")
+            if obj_dir:
+                raw_paths = [os.path.join(obj_dir, p) for p in raw_paths]
+                print(f"obj_dir={obj_dir}, {len(set(raw_paths))} unique URDF paths")
+            self.demo_data["obj_urdf_path"] = raw_paths
             self.demo_data["scene_objs"] = [[] for _ in range(num_chunks)]  # no scene objects in .pt
 
             # Assign initial motion_ids

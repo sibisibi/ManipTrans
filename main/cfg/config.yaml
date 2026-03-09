@@ -36,6 +36,7 @@ useBPS: True
 dataIndices: [7]
 data_dir: ''
 index_path: ''
+obj_dir: ''
 
 # Curriculum
 tighten_steps: ''
