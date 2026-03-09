@@ -94,6 +94,43 @@ class ResRHDictObsNetwork(A2CBuilder.Network):
             else:
                 sigma_init(self.sigma.weight)
 
+        # Auto-detect base model architecture from checkpoint
+        ckp_path = params["base_model"].get(self.side_checkpoint)
+        _base_model_sd = None
+        if ckp_path is not None:
+            _ckp = torch.load(ckp_path, map_location="cpu")
+            _base_model_sd = {
+                k.replace("a2c_network.", ""): v
+                for k, v in _ckp["model"].items() if "a2c_network" in k
+            }
+            del _ckp
+
+            has_critic_mlp = any(k.startswith("critic_mlp.") for k in _base_model_sd)
+            params["base_model"]["separate"] = has_critic_mlp
+
+            head_weights = sorted(
+                [k for k in _base_model_sd
+                 if k.startswith("dict_feature_encoder._head.") and k.endswith(".weight")],
+                key=lambda k: int(k.split(".")[-2])
+            )
+            if head_weights:
+                params["base_model"]["dict_feature_encoder"]["hidden_dim"] = _base_model_sd[head_weights[0]].shape[0]
+                params["base_model"]["dict_feature_encoder"]["output_dim"] = _base_model_sd[head_weights[-1]].shape[0]
+                params["base_model"]["dict_feature_encoder"]["hidden_depth"] = len(head_weights) - 1
+
+            mlp_weights = sorted(
+                [k for k in _base_model_sd if k.startswith("actor_mlp.") and k.endswith(".weight")],
+                key=lambda k: int(k.split(".")[1])
+            )
+            if mlp_weights:
+                params["base_model"]["mlp"]["units"] = [_base_model_sd[k].shape[0] for k in mlp_weights]
+
+            print(f"[base_model] Auto-detected from checkpoint: "
+                  f"separate={has_critic_mlp}, "
+                  f"hidden_dim={params['base_model']['dict_feature_encoder'].get('hidden_dim')}, "
+                  f"output_dim={params['base_model']['dict_feature_encoder'].get('output_dim')}, "
+                  f"mlp={params['base_model']['mlp'].get('units')}")
+
         config = {
             "actions_num": actions_num + (3 if kwargs["use_pid_control"] else 0),
             "input_shape": None,
@@ -106,11 +143,9 @@ class ResRHDictObsNetwork(A2CBuilder.Network):
         builder = ModelNetworkBuilder()
         self.base_net = builder.load(params["base_model"])
         self.base_model = self.base_net.build(params["name"], **config)
-        if params["base_model"][self.side_checkpoint] is not None:
-            base_model_ckp = torch.load(params["base_model"][self.side_checkpoint])
-            self.base_model.load_state_dict(
-                {k.replace("a2c_network.", ""): v for k, v in base_model_ckp["model"].items() if "a2c_network" in k}
-            )
+        if _base_model_sd is not None:
+            self.base_model.load_state_dict(_base_model_sd)
+            del _base_model_sd
             self.loaded_checkpoint = True
         else:
             from termcolor import cprint
