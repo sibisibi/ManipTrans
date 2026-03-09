@@ -34,9 +34,51 @@ class ResRHDictObsNetwork(A2CBuilder.Network):
         else:
             out_size = self.units[-1]
 
+        # Auto-detect base model architecture from checkpoint (must happen before MLP construction)
+        ckp_path = params["base_model"].get(self.side_checkpoint)
+        _base_model_sd = None
+        _base_action_dim = params["base_model"]["action_size"] + (3 if kwargs["use_pid_control"] else 0)
+        if ckp_path is not None:
+            _ckp = torch.load(ckp_path, map_location="cpu")
+            _base_model_sd = {
+                k.replace("a2c_network.", ""): v
+                for k, v in _ckp["model"].items() if "a2c_network" in k
+            }
+            del _ckp
+
+            # Detect action dim from mu.weight (includes PID if checkpoint was trained with it)
+            if "mu.weight" in _base_model_sd:
+                _base_action_dim = _base_model_sd["mu.weight"].shape[0]
+
+            has_critic_mlp = any(k.startswith("critic_mlp.") for k in _base_model_sd)
+            params["base_model"]["separate"] = has_critic_mlp
+
+            head_weights = sorted(
+                [k for k in _base_model_sd
+                 if k.startswith("dict_feature_encoder._head.") and k.endswith(".weight")],
+                key=lambda k: int(k.split(".")[-2])
+            )
+            if head_weights:
+                params["base_model"]["dict_feature_encoder"]["hidden_dim"] = _base_model_sd[head_weights[0]].shape[0]
+                params["base_model"]["dict_feature_encoder"]["output_dim"] = _base_model_sd[head_weights[-1]].shape[0]
+                params["base_model"]["dict_feature_encoder"]["hidden_depth"] = len(head_weights) - 1
+
+            mlp_weights = sorted(
+                [k for k in _base_model_sd if k.startswith("actor_mlp.") and k.endswith(".weight")],
+                key=lambda k: int(k.split(".")[1])
+            )
+            if mlp_weights:
+                params["base_model"]["mlp"]["units"] = [_base_model_sd[k].shape[0] for k in mlp_weights]
+
+            print(f"[base_model] Auto-detected from checkpoint: "
+                  f"separate={has_critic_mlp}, "
+                  f"hidden_dim={params['base_model']['dict_feature_encoder'].get('hidden_dim')}, "
+                  f"output_dim={params['base_model']['dict_feature_encoder'].get('output_dim')}, "
+                  f"mlp={params['base_model']['mlp'].get('units')}, "
+                  f"action_dim={_base_action_dim}")
+
         mlp_args = {
-            "input_size": in_mlp_shape
-            + (params["base_model"]["action_size"] + (3 if kwargs["use_pid_control"] else 0)),
+            "input_size": in_mlp_shape + _base_action_dim,
             "units": self.units,
             "activation": self.activation,
             "norm_func_name": self.normalization,
@@ -94,45 +136,8 @@ class ResRHDictObsNetwork(A2CBuilder.Network):
             else:
                 sigma_init(self.sigma.weight)
 
-        # Auto-detect base model architecture from checkpoint
-        ckp_path = params["base_model"].get(self.side_checkpoint)
-        _base_model_sd = None
-        if ckp_path is not None:
-            _ckp = torch.load(ckp_path, map_location="cpu")
-            _base_model_sd = {
-                k.replace("a2c_network.", ""): v
-                for k, v in _ckp["model"].items() if "a2c_network" in k
-            }
-            del _ckp
-
-            has_critic_mlp = any(k.startswith("critic_mlp.") for k in _base_model_sd)
-            params["base_model"]["separate"] = has_critic_mlp
-
-            head_weights = sorted(
-                [k for k in _base_model_sd
-                 if k.startswith("dict_feature_encoder._head.") and k.endswith(".weight")],
-                key=lambda k: int(k.split(".")[-2])
-            )
-            if head_weights:
-                params["base_model"]["dict_feature_encoder"]["hidden_dim"] = _base_model_sd[head_weights[0]].shape[0]
-                params["base_model"]["dict_feature_encoder"]["output_dim"] = _base_model_sd[head_weights[-1]].shape[0]
-                params["base_model"]["dict_feature_encoder"]["hidden_depth"] = len(head_weights) - 1
-
-            mlp_weights = sorted(
-                [k for k in _base_model_sd if k.startswith("actor_mlp.") and k.endswith(".weight")],
-                key=lambda k: int(k.split(".")[1])
-            )
-            if mlp_weights:
-                params["base_model"]["mlp"]["units"] = [_base_model_sd[k].shape[0] for k in mlp_weights]
-
-            print(f"[base_model] Auto-detected from checkpoint: "
-                  f"separate={has_critic_mlp}, "
-                  f"hidden_dim={params['base_model']['dict_feature_encoder'].get('hidden_dim')}, "
-                  f"output_dim={params['base_model']['dict_feature_encoder'].get('output_dim')}, "
-                  f"mlp={params['base_model']['mlp'].get('units')}")
-
         config = {
-            "actions_num": actions_num + (3 if kwargs["use_pid_control"] else 0),
+            "actions_num": _base_action_dim,
             "input_shape": None,
             "num_seqs": self.num_seqs,
             "value_size": self.value_size,
