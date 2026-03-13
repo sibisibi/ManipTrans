@@ -58,6 +58,7 @@ class DexHandManipRHEnv(VecTask):
         use_quat_rot = self.use_quat_rot = self.cfg["env"]["useQuatRot"]
         self.max_episode_length = self.cfg["env"]["episodeLength"]
         self.action_scale = self.cfg["env"]["actionScale"]
+        self.residual_action_scale = self.cfg["env"]["residualActionScale"]
         self.aggregate_mode = self.cfg["env"]["aggregateMode"]
         self.training = self.cfg["env"]["training"]
 
@@ -1480,7 +1481,7 @@ class DexHandManipRHEnv(VecTask):
             else ((actions.shape[1] - (root_control_dim - 6)) // 2 + (root_control_dim - 6))
         )
         base_action = actions[:, :res_split_idx]  # ? in the range of [-1, 1]
-        residual_action = actions[:, res_split_idx:] * 2  # ? the delta action is theoritically in the range of [-2, 2]
+        residual_action = actions[:, res_split_idx:] * self.residual_action_scale  # ? the delta action is theoritically in the range of [-residual_action_scale, residual_action_scale]
         dof_pos = (
             1.0 * base_action[:, root_control_dim : root_control_dim + self.num_dexhand_dofs]
             + residual_action[:, 6 : 6 + self.num_dexhand_dofs]

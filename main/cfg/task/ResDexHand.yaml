@@ -46,6 +46,7 @@ env:
   tightenSteps: 3200
 
   actionScale: 1.0
+  residualActionScale: 2.0
   useQuatRot: false
 
   # for distillation
