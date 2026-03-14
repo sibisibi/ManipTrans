@@ -59,6 +59,7 @@ class DexHandManipRHEnv(VecTask):
         self.max_episode_length = self.cfg["env"]["episodeLength"]
         self.action_scale = self.cfg["env"]["actionScale"]
         self.residual_action_scale = self.cfg["env"]["residualActionScale"]
+        self.finger_tip_force_weight = self.cfg["env"].get("fingerTipForceWeight", 1.0)
         self.aggregate_mode = self.cfg["env"]["aggregateMode"]
         self.training = self.cfg["env"]["training"]
 
@@ -1033,6 +1034,7 @@ class DexHandManipRHEnv(VecTask):
             max_length,
             scale_factor,
             self.dexhand.weight_idx,
+            self.finger_tip_force_weight,
         )
         self.total_rew_buf += self.rew_buf
 
@@ -1660,9 +1662,10 @@ def compute_imitation_reward(
     max_length: List[int],
     scale_factor: float,
     dexhand_weight_idx: Dict[str, List[int]],
+    finger_tip_force_weight: float,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
 
-    # type: (Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, Tensor], Tensor, float, Dict[str, List[int]]) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Tensor]
+    # type: (Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, Tensor], Tensor, float, Dict[str, List[int]], float) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Tensor]
 
     # end effector pose reward
     current_eef_pos = states["base_state"][:, :3]
@@ -1797,7 +1800,7 @@ def compute_imitation_reward(
         + 0.1 * reward_joints_vel
         + 0.1 * reward_obj_vel
         + 0.1 * reward_obj_ang_vel
-        + 1.0 * reward_finger_tip_force
+        + finger_tip_force_weight * reward_finger_tip_force
         + 0.5 * reward_power
         + 0.5 * reward_wrist_power
     )

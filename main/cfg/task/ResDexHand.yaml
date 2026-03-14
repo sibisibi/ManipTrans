@@ -47,6 +47,7 @@ env:
 
   actionScale: 1.0
   residualActionScale: 2.0
+  fingerTipForceWeight: ${resolve_default:1.0,${...finger_tip_force_weight}}
   useQuatRot: false
 
   # for distillation
