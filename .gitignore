@@ -188,4 +188,6 @@ annotator*.py
 make*.py
 
 runs
-runs/*
+runs/*dumps/
+data/lab_dump/
+maniptrans_lab/assets/
