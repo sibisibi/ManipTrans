@@ -23,6 +23,7 @@ from datetime import datetime
 
 import numpy
 import torch
+import wandb
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
@@ -71,6 +72,7 @@ from lib.rl.models import ModelA2CContinuousLogStd
 from lib.rl.network_builder_residual_bih import ResBiHDictObsBuilder
 from lib.rl.res_models import ModelA2CContinuousLogStdResBiH
 from rl_games.algos_torch.model_builder import register_network, register_model
+from rl_games.common.algo_observer import AlgoObserver
 from rl_games.common import env_configurations, vecenv
 
 from isaaclab.assets import AssetBaseCfg
@@ -80,11 +82,43 @@ import isaaclab.sim as sim_utils
 from isaaclab.sensors import Camera, CameraCfg
 from maniptrans_lab.tasks.bih.collision_filter import author_hand_table_filter
 from maniptrans_lab.rl_adapter import GymSurface
-from maniptrans_lab.tasks.bih.env_cfg import BiHManipEnvCfg
+from maniptrans_lab.tasks.bih.env_cfg import TABLE_POS, TABLE_SIZE, BiHManipEnvCfg
+from maniptrans_lab.utils.pose_viewer import BiHPoseViewer
 
 class _SingleCamera(Camera):
     def reset(self, env_ids=None):
         super().reset(None)  # one camera serves every env so per-env reset indexing does not apply
+
+
+class _WandbTeeWriter:
+    """Forwards every scalar to the real writer and buffers it for one wandb row per epoch."""
+
+    def __init__(self, inner, buffer):
+        self._inner = inner
+        self._buffer = buffer
+
+    def add_scalar(self, tag, value, *args, **kwargs):
+        self._inner.add_scalar(tag, value, *args, **kwargs)
+        self._buffer[tag] = float(value)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class _WandbObserver(AlgoObserver):
+    def __init__(self):
+        self._buffer = {}
+        self._algo = None
+
+    def after_init(self, algo):
+        self._algo = algo
+        algo.writer = _WandbTeeWriter(algo.writer, self._buffer)
+
+    def after_print_stats(self, frame, epoch_num, total_time):
+        if self._buffer:
+            self._buffer["env_steps"] = frame
+            wandb.log(self._buffer)
+            self._buffer.clear()
 
 
 def preprocess_train_config(cfg, config_dict):
@@ -178,7 +212,18 @@ def main():
     os.makedirs(experiment_dir, exist_ok=True)
 
     env = ManagerBasedRLEnv(cfg=env_cfg)
-    adapter = GymSurface(env, clip_obs=cfg.task.env.clipObservations)
+    viewer = None
+    if not args.test:
+        viewer = BiHPoseViewer(
+            env,
+            log_dir=experiment_dir,
+            hand_urdf_dir=os.path.join(REPO, "maniptrans_envs", "assets", "mano_urdf"),
+            obj_scale={"rh": 1.15, "lh": 0.95},  # gym oakink2_obj_scale for this clip
+            table_size=TABLE_SIZE,
+            table_pos=TABLE_POS,
+            interval=5_000_000 // args.num_envs,
+        )
+    adapter = GymSurface(env, clip_obs=cfg.task.env.clipObservations, pose_viewer=viewer)
 
     env_configurations.register("rlgpu", {"vecenv_type": "RLGPU", "env_creator": lambda **kw: adapter})
     vecenv.register("RLGPU", lambda config_name, num_actors: ComplexObsRLGPUEnv(config_name))
@@ -188,7 +233,14 @@ def main():
     # the lab entry always trains without imitator checkpoints and leaves gym's network layout untouched
     rlg_config_dict["params"]["network"]["base_model"]["drop_when_none"] = True
 
-    runner = Runner(MultiObserver([RLGPUAlgoObserver()]))
+    observers = [RLGPUAlgoObserver()]
+    if not args.test:
+        wandb.init(name=args.experiment, config=rlg_config_dict)
+        wandb.define_metric("env_steps")
+        wandb.define_metric("*", step_metric="env_steps")
+        observers.append(_WandbObserver())
+
+    runner = Runner(MultiObserver(observers))
     runner.load(rlg_config_dict)
     runner.reset()
 
