@@ -32,9 +32,16 @@ class ResBiHDictObsNetwork(A2CBuilder.Network):
         else:
             out_size = self.units[-1]
 
+        # drop_when_none skips the frozen base models and their input to the actor when no imitator checkpoint is set
+        self._base_act_dim = params["base_model"]["action_size"] + (3 if kwargs["use_pid_control"] else 0)
+        self._drop_base = (
+            params["base_model"].get("drop_when_none", False)
+            and params["base_model"]["rh_checkpoint"] is None
+            and params["base_model"]["lh_checkpoint"] is None
+        )
+
         mlp_args = {
-            "input_size": in_mlp_shape
-            + (params["base_model"]["action_size"] + (3 if kwargs["use_pid_control"] else 0)) * 2,
+            "input_size": in_mlp_shape + (0 if self._drop_base else self._base_act_dim * 2),
             "units": self.units,
             "activation": self.activation,
             "norm_func_name": self.normalization,
@@ -93,6 +100,12 @@ class ResBiHDictObsNetwork(A2CBuilder.Network):
                 sigma_init(self.sigma)
             else:
                 sigma_init(self.sigma.weight)
+
+        if self._drop_base:
+            self.rh_base_model = None
+            self.lh_base_model = None
+            self.loaded_checkpoint = False
+            return
 
         # ! very important to init the base model after init residual network
         config = {
@@ -162,24 +175,29 @@ class ResBiHDictObsNetwork(A2CBuilder.Network):
         if self.separate:
             raise NotImplementedError("separate not implemented")
         else:
-            rh_base_mu, rh_base_logstd, rh_base_value, rh_base_states = self.rh_base_model(rh_base_obs_dict)
-            lh_base_mu, lh_base_logstd, lh_base_value, lh_base_states = self.lh_base_model(lh_base_obs_dict)
             out = obs
             out = self.actor_cnn(out)
             out = out.flatten(1)
 
-            rh_base_sigma = torch.exp(rh_base_logstd)
-            rh_base_distr = torch.distributions.Normal(rh_base_mu, rh_base_sigma, validate_args=False)
-            rh_base_action = rh_base_distr.sample()
-            lh_base_sigma = torch.exp(lh_base_logstd)
-            lh_base_distr = torch.distributions.Normal(lh_base_mu, lh_base_sigma, validate_args=False)
-            lh_base_action = lh_base_distr.sample()
+            if self._drop_base:
+                rh_base_action = torch.zeros(out.shape[0], self._base_act_dim, device=out.device)
+                lh_base_action = rh_base_action
+            else:
+                rh_base_mu, rh_base_logstd, rh_base_value, rh_base_states = self.rh_base_model(rh_base_obs_dict)
+                lh_base_mu, lh_base_logstd, lh_base_value, lh_base_states = self.lh_base_model(lh_base_obs_dict)
 
-            if not self.loaded_checkpoint:
-                rh_base_action = torch.zeros_like(rh_base_action)
-                lh_base_action = torch.zeros_like(lh_base_action)
+                rh_base_sigma = torch.exp(rh_base_logstd)
+                rh_base_distr = torch.distributions.Normal(rh_base_mu, rh_base_sigma, validate_args=False)
+                rh_base_action = rh_base_distr.sample()
+                lh_base_sigma = torch.exp(lh_base_logstd)
+                lh_base_distr = torch.distributions.Normal(lh_base_mu, lh_base_sigma, validate_args=False)
+                lh_base_action = lh_base_distr.sample()
 
-            out = torch.cat([out, rh_base_action, lh_base_action], dim=1)
+                if not self.loaded_checkpoint:
+                    rh_base_action = torch.zeros_like(rh_base_action)
+                    lh_base_action = torch.zeros_like(lh_base_action)
+
+                out = torch.cat([out, rh_base_action, lh_base_action], dim=1)
 
             out = self.actor_mlp(out)
             value = self.value_act(self.value(out))

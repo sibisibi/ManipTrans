@@ -28,6 +28,11 @@ actionsMovingAverage: 1.0
 
 usePIDControl: False
 
+# when true the base action comes from the retargeted trajectory instead of the frozen imitator
+useRetargetedBase: False
+# wrist position error in metres that saturates the base channel
+retargetedBaseWristPosScale: 0.1
+
 dataIndices: [7]
 
 # seed - set to -1 to choose random seed

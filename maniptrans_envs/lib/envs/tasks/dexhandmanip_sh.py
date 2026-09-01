@@ -21,7 +21,7 @@ from main.dataset.factory import ManipDataFactory
 from main.dataset.oakink2_dataset_dexhand_rh import OakInk2DatasetDexHandRH
 from main.dataset.oakink2_dataset_dexhand_lh import OakInk2DatasetDexHandLH
 from main.dataset.oakink2_dataset_utils import oakink2_obj_scale, oakink2_obj_mass
-from main.dataset.transform import aa_to_quat, aa_to_rotmat, quat_to_rotmat, rotmat_to_aa, rotmat_to_quat, rot6d_to_aa
+from main.dataset.transform import aa_to_quat, aa_to_rotmat, quat_to_rotmat, rotmat_to_aa, rotmat_to_quat, rot6d_to_aa, rotmat_to_rot6d
 from torch import Tensor
 from tqdm import tqdm
 from ...asset_root import ASSET_ROOT
@@ -65,6 +65,8 @@ class DexHandManipRHEnv(VecTask):
             self.dexhand = DexHandFactory.create_hand(self.cfg["env"]["dexhand"], "right")
 
         self.use_pid_control = self.cfg["env"]["usePIDControl"]
+        self.use_retargeted_base = self.cfg["env"]["useRetargetedBase"]
+        self.retargeted_base_wrist_pos_scale = self.cfg["env"]["retargetedBaseWristPosScale"]
         if self.use_pid_control:
             self.Kp_rot = self.dexhand.Kp_rot
             self.Ki_rot = self.dexhand.Ki_rot
@@ -1200,6 +1202,26 @@ class DexHandManipRHEnv(VecTask):
         info["total_steps"] = self.progress_buf
         return obs, rew, done, info
 
+    def _retargeted_base_action(self):
+        # the base action carries wrist position error, wrist rotation error, and joint targets from the retargeted trajectory
+        cur_idx = self.progress_buf
+        env_idx = torch.arange(self.num_envs)
+
+        ref_wrist_pos = self.demo_data["opt_wrist_pos"][env_idx, cur_idx]
+        ref_wrist_rotmat = aa_to_rotmat(self.demo_data["opt_wrist_rot"][env_idx, cur_idx])
+        ref_dof_pos = self.demo_data["opt_dof_pos"][env_idx, cur_idx]
+
+        cur_wrist_pos = self._base_state[:, :3]
+        cur_wrist_rotmat = quat_to_rotmat(self._base_state[:, 3:7][:, [3, 0, 1, 2]])
+
+        pos_error = (ref_wrist_pos - cur_wrist_pos) / self.retargeted_base_wrist_pos_scale
+        rot_error = rotmat_to_rot6d(ref_wrist_rotmat @ cur_wrist_rotmat.transpose(-1, -2))
+        dof_target = torch_jit_utils.unscale(
+            ref_dof_pos, self.dexhand_dof_lower_limits, self.dexhand_dof_upper_limits
+        )
+
+        return torch.clamp(torch.cat([pos_error, rot_error, dof_target], dim=-1), -1, 1)
+
     def pre_physics_step(self, actions):
 
         # ? >>> for visualization
@@ -1242,6 +1264,8 @@ class DexHandManipRHEnv(VecTask):
         )
         base_action = actions[:, :res_split_idx]  # ? in the range of [-1, 1]
         residual_action = actions[:, res_split_idx:] * 2  # ? the delta action is theoritically in the range of [-2, 2]
+        if self.use_retargeted_base:
+            base_action = self._retargeted_base_action()
         dof_pos = (
             1.0 * base_action[:, root_control_dim : root_control_dim + self.num_dexhand_dofs]
             + residual_action[:, 6 : 6 + self.num_dexhand_dofs]

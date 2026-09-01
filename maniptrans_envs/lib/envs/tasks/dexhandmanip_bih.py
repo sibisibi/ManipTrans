@@ -23,7 +23,7 @@ from main.dataset.factory import ManipDataFactory
 from main.dataset.oakink2_dataset_dexhand_lh import OakInk2DatasetDexHandLH
 from main.dataset.oakink2_dataset_dexhand_rh import OakInk2DatasetDexHandRH
 from main.dataset.oakink2_dataset_utils import oakink2_obj_scale, oakink2_obj_mass
-from main.dataset.transform import aa_to_quat, aa_to_rotmat, quat_to_rotmat, rotmat_to_aa, rotmat_to_quat, rot6d_to_aa
+from main.dataset.transform import aa_to_quat, aa_to_rotmat, quat_to_rotmat, rotmat_to_aa, rotmat_to_quat, rot6d_to_aa, rotmat_to_rot6d
 from torch import Tensor
 from tqdm import tqdm
 from ...asset_root import ASSET_ROOT
@@ -65,6 +65,8 @@ class DexHandManipBiHEnv(VecTask):
         self.dexhand_lh = DexHandFactory.create_hand(self.cfg["env"]["dexhand"], "left")
 
         self.use_pid_control = self.cfg["env"]["usePIDControl"]
+        self.use_retargeted_base = self.cfg["env"]["useRetargetedBase"]
+        self.retargeted_base_wrist_pos_scale = self.cfg["env"]["retargetedBaseWristPosScale"]
         if self.use_pid_control:
             self.Kp_rot = self.dexhand_rh.Kp_rot
             self.Ki_rot = self.dexhand_rh.Ki_rot
@@ -654,6 +656,8 @@ class DexHandManipBiHEnv(VecTask):
         CONTACT_HISTORY_LEN = 3
         self.rh_tips_contact_history = torch.ones(self.num_envs, CONTACT_HISTORY_LEN, 5, device=self.device).bool()
         self.lh_tips_contact_history = torch.ones(self.num_envs, CONTACT_HISTORY_LEN, 5, device=self.device).bool()
+        self._eval_outcome = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
+        self._eval_reported = False
 
     def pack_data(self, data, side="rh"):
         packed_data = {}
@@ -1457,6 +1461,14 @@ class DexHandManipBiHEnv(VecTask):
 
     def reset_idx(self, env_ids):
         self._refresh()
+        if not self.training:
+            ran = self.running_progress_buf[env_ids] > 0  # the initialization reset carries no episode
+            pending = env_ids[ran & (self._eval_outcome[env_ids] < 0)]
+            self._eval_outcome[pending] = self.success_buf[pending].long()
+            if (self._eval_outcome >= 0).all() and not self._eval_reported:
+                sr = (self._eval_outcome == 1).float().mean().item() * 100
+                print(f"[eval] first-episode success from frame 0: {sr:.2f}% over {self.num_envs} envs", flush=True)
+                self._eval_reported = True
         if self.randomize:
             self.apply_randomizations(self.dr_randomizations)
 
@@ -1492,6 +1504,34 @@ class DexHandManipBiHEnv(VecTask):
         info["total_rewards"] = self.total_rew_buf
         info["total_steps"] = self.progress_buf
         return obs, rew, done, info
+
+    def _retargeted_base_action(self):
+        # the base action carries wrist position error, wrist rotation error, and joint targets from the retargeted trajectory, per hand
+        cur_idx = self.progress_buf
+        env_idx = torch.arange(self.num_envs)
+
+        def side_block(demo_data, base_state, dof_lower, dof_upper):
+            ref_wrist_pos = demo_data["opt_wrist_pos"][env_idx, cur_idx]
+            ref_wrist_rotmat = aa_to_rotmat(demo_data["opt_wrist_rot"][env_idx, cur_idx])
+            ref_dof_pos = demo_data["opt_dof_pos"][env_idx, cur_idx]
+
+            cur_wrist_pos = base_state[:, :3]
+            cur_wrist_rotmat = quat_to_rotmat(base_state[:, 3:7][:, [3, 0, 1, 2]])
+
+            pos_error = (ref_wrist_pos - cur_wrist_pos) / self.retargeted_base_wrist_pos_scale
+            rot_error = rotmat_to_rot6d(ref_wrist_rotmat @ cur_wrist_rotmat.transpose(-1, -2))
+            dof_target = torch_jit_utils.unscale(ref_dof_pos, dof_lower, dof_upper)
+            return torch.cat([pos_error, rot_error, dof_target], dim=-1)
+
+        rh = side_block(
+            self.demo_data_rh, self._rh_base_state,
+            self.dexhand_rh_dof_lower_limits, self.dexhand_rh_dof_upper_limits,
+        )
+        lh = side_block(
+            self.demo_data_lh, self._lh_base_state,
+            self.dexhand_lh_dof_lower_limits, self.dexhand_lh_dof_upper_limits,
+        )
+        return torch.clamp(torch.cat([rh, lh], dim=-1), -1, 1)
 
     def pre_physics_step(self, actions):
 
@@ -1546,6 +1586,8 @@ class DexHandManipBiHEnv(VecTask):
 
         base_action = actions[:, :res_split_idx]  # ? in the range of [-1, 1]
         residual_action = actions[:, res_split_idx:] * 2  # ? the delta action is theoritically in the range of [-2, 2]
+        if self.use_retargeted_base:
+            base_action = self._retargeted_base_action()
 
         rh_dof_pos = (
             1.0 * base_action[:, root_control_dim : root_control_dim + self.num_dexhand_rh_dofs]

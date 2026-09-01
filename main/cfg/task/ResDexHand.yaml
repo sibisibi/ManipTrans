@@ -13,6 +13,8 @@ env:
   training: ${if:${...test},False,True}
 
   usePIDControl: ${...usePIDControl}
+  useRetargetedBase: ${...useRetargetedBase}
+  retargetedBaseWristPosScale: ${...retargetedBaseWristPosScale}
 
   rolloutStateInit: ${resolve_default:False,${...rolloutStateInit}}
   randomStateInit: ${resolve_default:True,${...randomStateInit}}
